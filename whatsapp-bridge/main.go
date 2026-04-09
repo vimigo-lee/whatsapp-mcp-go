@@ -2019,10 +2019,10 @@ func (store *MessageStore) ListChats(
 	}
 	q += " ORDER BY " + order
 
-	q += " LIMIT " + placeholder(len(args)+1)
+	q += " LIMIT " + placeholder(len(args)+1) + "::int"
 	args = append(args, limit)
 
-	q += " OFFSET " + placeholder(len(args)+2)
+	q += " OFFSET " + placeholder(len(args)+1) + "::int"
 	args = append(args, page*limit)
 
 	rows, err := store.db.Query(q, args...)
