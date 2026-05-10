@@ -67,6 +67,11 @@ func SendMessage(recipient, message string) (bool, string) {
 		return false, "Recipient must be provided"
 	}
 
+	token, err := GetOrRefreshJwtToken()
+	if err != nil {
+		return false, "Authentication failed: " + err.Error()
+	}
+
 	payload := map[string]string{
 		"recipient": recipient,
 		"message":   message,
@@ -75,6 +80,7 @@ func SendMessage(recipient, message string) (bool, string) {
 	body, _ := json.Marshal(payload)
 	req, _ := http.NewRequest("POST", apiBaseURL+"/send", bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -113,6 +119,11 @@ func SendFile(recipient, mediaPath string) (bool, string) {
 		return false, "Media file not found: " + mediaPath
 	}
 
+	token, err := GetOrRefreshJwtToken()
+	if err != nil {
+		return false, "Authentication failed: " + err.Error()
+	}
+
 	payload := map[string]string{
 		"recipient":  recipient,
 		"media_path": mediaPath,
@@ -121,6 +132,7 @@ func SendFile(recipient, mediaPath string) (bool, string) {
 	body, _ := json.Marshal(payload)
 	req, _ := http.NewRequest("POST", apiBaseURL+"/send", bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -174,6 +186,11 @@ func SendAudioVoiceMessage(recipient, mediaPath string) (bool, string) {
 		}(finalPath)
 	}
 
+	token, err := GetOrRefreshJwtToken()
+	if err != nil {
+		return false, "Authentication failed: " + err.Error()
+	}
+
 	payload := map[string]string{
 		"recipient":  recipient,
 		"media_path": finalPath,
@@ -182,6 +199,7 @@ func SendAudioVoiceMessage(recipient, mediaPath string) (bool, string) {
 	body, _ := json.Marshal(payload)
 	req, _ := http.NewRequest("POST", apiBaseURL+"/send", bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
