@@ -99,18 +99,27 @@ docker compose up
 
 ## Authentication
 
-The HTTP API is protected using **API Key or JWT authentication**.
+The HTTP API uses a two-step **API key → JWT** flow. The `API_KEY` you set in
+`docker-compose.yaml` is exchanged for a short-lived JWT, which is then used
+on every subsequent request to `/api/*`.
 
-You must include one of the following headers in every request.
+### 1. Exchange the API key for a JWT
 
-### API Key
+```bash
+curl -X POST http://localhost:8080/auth/login \
+  -H "Authorization: Bearer <your-api-key>"
+# => {"token":"<jwt>"}
+```
 
-Authorization: ApiKey <your-api-key>
+### 2. Call protected endpoints with the JWT
 
-Example:
+```bash
+curl -H "Authorization: Bearer <jwt>" \
+  http://localhost:8080/api/messages
+```
 
-curl -H "Authorization: ApiKey your-api-key" \
-http://localhost:8080/messages
+The MCP server handles this exchange automatically — you only need to set the
+`WHATSAPP_API_SECRET` environment variable to match the bridge's `API_KEY`.
 
 ## Architecture Overview
 
