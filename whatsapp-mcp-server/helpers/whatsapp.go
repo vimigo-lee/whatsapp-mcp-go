@@ -210,6 +210,11 @@ func SendAudioVoiceMessage(recipient, mediaPath string) (bool, string) {
 }
 
 func DownloadMedia(messageID, chatJID string) (string, error) {
+	token, err := GetOrRefreshJwtToken()
+	if err != nil {
+		return "", fmt.Errorf("authentication failed: %w", err)
+	}
+
 	payload := map[string]string{
 		"message_id": messageID,
 		"chat_jid":   chatJID,
@@ -218,6 +223,7 @@ func DownloadMedia(messageID, chatJID string) (string, error) {
 	body, _ := json.Marshal(payload)
 	req, _ := http.NewRequest("POST", apiBaseURL+"/download", bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
