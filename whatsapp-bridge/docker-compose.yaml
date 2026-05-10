@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   wa:
     build:
@@ -13,9 +11,12 @@ services:
       POSTGRES_PASS: "test"
       POSTGRES_HOST: "postgres"
       POSTGRES_PORT: "5432"
-      API_KEY: "c3VwZXItbG9uZy1yYW5kb20tc3RyaW5nLW1pbmltdW0tb2YtNjQtY2hhcmFjdGVycy15b3UtbmVlZC10by1wYXN0ZS1oZXJl"
-      JWT_SECRET: "YW5vdGhlci1zdXBlci1sb25nLXJhbmRvbS1zdHJpbmctbWluaW11bS1vZi02NC1jaGFyYWN0ZXJzLXlvdS1uZWVkLXRvLXBhc3RlLWhlcmU="
-      WEBHOOK_URL: "http://192.168.178.52:5678/webhook-test/whatsapp"
+      # Replace with two strong, independent random strings before bringing the stack up.
+      # Suggested: openssl rand -base64 64 | tr -d '\n=' | tr '/+' '_-' | head -c 64
+      API_KEY: "CHANGE_ME_TO_A_LONG_RANDOM_STRING_AT_LEAST_64_CHARS_______________"
+      JWT_SECRET: "CHANGE_ME_TO_A_DIFFERENT_LONG_RANDOM_STRING_AT_LEAST_64_CHARS____"
+      # Optional: set this to forward every inbound message to a webhook (e.g. n8n).
+      # WEBHOOK_URL: "http://your-host:5678/webhook/whatsapp"
     ports:
       - "8080:8080"
     volumes:
@@ -37,7 +38,7 @@ services:
     environment:
       POSTGRES_USER: "test"
       POSTGRES_PASSWORD: "test"
-      POSTGRES_DB: "testdb"
+      POSTGRES_DB: "whatsapp"
     ports:
       - "5432:5432"
     volumes:
