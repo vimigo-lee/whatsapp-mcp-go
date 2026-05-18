@@ -1706,6 +1706,10 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
+				if time.Since(timestamp) > 30*24*time.Hour {
+					continue
+				}
+
 				err = messageStore.StoreMessage(
 					msgID,
 					chatJID,
