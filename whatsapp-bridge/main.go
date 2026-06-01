@@ -1593,11 +1593,22 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
-		if err == nil && contact.FullName != "" {
-			name = contact.FullName
-		} else if sender != "" {
+		if err == nil {
+			switch {
+			case contact.FullName != "":
+				name = contact.FullName
+			case contact.PushName != "":
+				name = contact.PushName
+			case contact.FirstName != "":
+				name = contact.FirstName
+			}
+		}
+
+		if name == "" && sender != "" {
 			name = sender
-		} else {
+		}
+
+		if name == "" {
 			name = jid.User
 		}
 
