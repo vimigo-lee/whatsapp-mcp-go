@@ -252,6 +252,7 @@ func sendMessageHandler(
 	payload := map[string]any{
 		"recipient": in.Recipient,
 		"message":   in.Message,
+		"no_delay":  true,
 	}
 
 	data, err := callAPI(http.MethodPost, "/send", payload)
