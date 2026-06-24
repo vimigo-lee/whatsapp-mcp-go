@@ -842,7 +842,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		}
 
 		content := extractTextContent(msg.Message)
-		if content == "" {
+		mediaType, filename, _, _, _, _, _ := extractMediaInfo(msg.Message)
+
+		if content == "" && mediaType == "" {
 			return
 		}
 
@@ -855,6 +857,8 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			"push_name":  msg.Info.PushName,
 			"is_group":   strings.Contains(msg.Info.Chat.String(), "@g.us"),
 			"message_id": msg.Info.ID,
+			"media_type": mediaType,
+			"filename":   filename,
 		}
 
 		jsonData, err := json.Marshal(payload)
