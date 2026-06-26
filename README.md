@@ -234,30 +234,6 @@ By default, just the metadata of the media is stored in the local database. The 
 4. Data flows back through the chain to Claude
 5. When sending messages, the request flows from Claude through the MCP server to the bridge and to WhatsApp
 
-## Troubleshooting
-
-- Make sure both the Bridge application and the MCP server are running for the integration to work properly.
-- In case of the Client outdated (405) error in the Bridge Go server,
-    ```bash
-    06:13:28.434 [Client INFO] Starting WhatsApp client...
-    2025/07/29 06:13:28 Connecting to postgres
-    06:13:30.402 [Client ERROR] Client outdated (405) connect failure (client version: 2.3000.1021018791)
-    06:13:30.403 [Client/Socket ERROR] Error reading from websocket: websocket: close 1006 (abnormal closure): unexpecte
-    06:13:30.675 [Client ERROR] Failed to establish stable connection
-    ```
-
-    Run below command and fix any error in your code after upgrade and the bridge code will automatic update the whatsapp client version.
-    
-    ```bash
-    go get -u go.mau.fi/whatsmeow@latest
-    ```
-    
-    OR Update all packages
-    
-    ```bash
-    go get -u
-    ```
-
 ### Authentication Issues
 
 - **QR Code Not Displaying**: If the QR code doesn't appear, try restarting the authentication script. If issues persist, check if your terminal supports displaying QR codes.
