@@ -4689,6 +4689,17 @@ func main() {
 		return
 	}
 
+	// Per-number outbound proxy for WhatsApp traffic. Set by the supervisor via
+	// PROXY_URL (socks5://, http://, or https://). Must be configured before
+	// Connect(); changing it requires a bridge restart.
+	if addr := os.Getenv("PROXY_URL"); addr != "" {
+		if err := client.SetProxyAddress(addr); err != nil {
+			logger.Errorf("invalid PROXY_URL: %v", err)
+		} else {
+			logger.Infof("using proxy for WhatsApp traffic")
+		}
+	}
+
 	store.SetOSInfo("Linux", store.GetWAVersion())
 	store.DeviceProps.PlatformType = waCompanionReg.DeviceProps_CHROME.Enum()
 
