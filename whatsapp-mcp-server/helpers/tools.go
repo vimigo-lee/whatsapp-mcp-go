@@ -20,7 +20,7 @@ func readApiBaseURL() string {
 	return fallback
 }
 
-const apiTimeout = 25 * time.Second
+const apiTimeout = 60 * time.Second
 
 // OkResult return proper ok result for mcp tool
 func OkResult(v any) *mcp.CallToolResult {
