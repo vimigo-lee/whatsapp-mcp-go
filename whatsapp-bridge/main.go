@@ -1832,40 +1832,6 @@ func handleGroupInfoEvent(client *whatsmeow.Client, evt *events.GroupInfo, logge
 
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
-	go func() {
-		cfg, err := config.LoadConfig()
-		if err != nil {
-			return
-		}
-		defer func() {
-			if r := recover(); r != nil {
-				log.Println("Recovered in webhook goroutine:", r)
-			}
-		}()
-		if cfg.WebhookUrl == "" {
-			return
-		}
-
-		payload := buildWebhookPayload(client, msg)
-
-		jsonData, err := json.Marshal(payload)
-		if err != nil {
-			log.Println("Webhook marshal error:", err)
-			return
-		}
-
-		resp, err := http.Post(
-			cfg.WebhookUrl,
-			"application/json",
-			bytes.NewBuffer(jsonData),
-		)
-
-		if err != nil {
-			log.Println("Webhook POST error:", err)
-			return
-		}
-		defer resp.Body.Close()
-	}()
 	chatJID := normalizeUserJID(client, msg.Info.Chat).String()
 	sender := normalizeUserJID(client, msg.Info.Sender).User
 
@@ -1980,33 +1946,76 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 	if err != nil {
 		logger.Warnf("Failed to store message: %v", err)
-	} else {
-		// Count genuinely-unread incoming messages so the manager's unread board
-		// mirrors the phone. Skip status broadcasts (not a real chat). An outgoing
-		// message (sent from any of our devices) means we've seen the chat, so
-		// WhatsApp treats it as read — clear the badge to match, otherwise a chat
-		// you replied to on your phone lingers as unread on the board.
-		if chatJID != "status@broadcast" {
-			if !msg.Info.IsFromMe {
-				if err := messageStore.IncrementUnread(chatJID); err != nil {
-					logger.Warnf("Failed to increment unread: %v", err)
-				}
-			} else if err := messageStore.SetUnreadCount(chatJID, 0); err != nil {
-				logger.Warnf("Failed to clear unread on outgoing: %v", err)
-			}
-		}
-		timestamp := msg.Info.Timestamp.Format("2006-01-02 15:04:05")
-		direction := "←"
-		if msg.Info.IsFromMe {
-			direction = "→"
-		}
+		return
+	}
 
-		if mediaType != "" {
-			slog.Info("message", "ts", timestamp, "direction", direction, "sender", sender, "media_type", mediaType, "filename", filename, "content", content)
-		} else if content != "" {
-			slog.Info("message", "ts", timestamp, "direction", direction, "sender", sender, "content", content)
+	// Count genuinely-unread incoming messages so the manager's unread board
+	// mirrors the phone. Skip status broadcasts (not a real chat). An outgoing
+	// message (sent from any of our devices) means we've seen the chat, so
+	// WhatsApp treats it as read — clear the badge to match, otherwise a chat
+	// you replied to on your phone lingers as unread on the board.
+	if chatJID != "status@broadcast" {
+		if !msg.Info.IsFromMe {
+			if err := messageStore.IncrementUnread(chatJID); err != nil {
+				logger.Warnf("Failed to increment unread: %v", err)
+			}
+		} else if err := messageStore.SetUnreadCount(chatJID, 0); err != nil {
+			logger.Warnf("Failed to clear unread on outgoing: %v", err)
 		}
 	}
+	timestamp := msg.Info.Timestamp.Format("2006-01-02 15:04:05")
+	direction := "←"
+	if msg.Info.IsFromMe {
+		direction = "→"
+	}
+
+	if mediaType != "" {
+		slog.Info("message", "ts", timestamp, "direction", direction, "sender", sender, "media_type", mediaType, "filename", filename, "content", content)
+	} else if content != "" {
+		slog.Info("message", "ts", timestamp, "direction", direction, "sender", sender, "content", content)
+	}
+
+	// Fire the webhook only after the message is durably stored, so a webhook
+	// consumer never observes a message that the MCP's own message store lacks.
+	go func() {
+		cfg, err := config.LoadConfig()
+		if err != nil {
+			return
+		}
+		defer func() {
+			if r := recover(); r != nil {
+				log.Println("Recovered in webhook goroutine:", r)
+			}
+		}()
+		if cfg.WebhookUrl == "" {
+			return
+		}
+
+		payload := buildWebhookPayload(client, msg)
+
+		jsonData, err := json.Marshal(payload)
+		if err != nil {
+			log.Println("Webhook marshal error:", err)
+			return
+		}
+
+		resp, err := http.Post(
+			cfg.WebhookUrl,
+			"application/json",
+			bytes.NewBuffer(jsonData),
+		)
+
+		if err != nil {
+			log.Println("Webhook POST error:", err)
+			return
+		}
+		defer resp.Body.Close()
+
+		slog.Info("Webhook sent",
+			"message_id", msg.Info.ID,
+			"chat_jid", chatJID,
+		)
+	}()
 }
 
 // DownloadMediaRequest represents the request body for the download media API
