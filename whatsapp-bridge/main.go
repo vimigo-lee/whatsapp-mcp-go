@@ -117,6 +117,18 @@ type MessageStore struct {
 
 var isPostgres = false
 
+// passkeyState holds the in-flight WhatsApp "Shortcake" passkey linking handshake
+// for this bridge's single client. The challenge arrives via events.PairPasskeyRequest,
+// is relayed to a browser (which runs navigator.credentials.get on a whatsapp.com
+// origin), and the resulting assertion is posted back to /auth/passkey-response.
+var passkeyState = struct {
+	mu      sync.Mutex
+	request *types.WebAuthnPublicKey
+	code    string
+	skipUX  bool
+	errMsg  string
+}{}
+
 // displayLoc is the timezone used when rendering timestamps in API responses
 // (chat last-message times, message timestamps). DB rows are stored UTC-labeled,
 // so MCP/HTTP clients would otherwise see UTC; we convert to this zone so the
@@ -3315,6 +3327,86 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 		respondJSON(w, http.StatusOK, map[string]string{"code": code})
 	})
 
+	// --- WhatsApp passkey (Shortcake) linking relay ---------------------------
+	// GET /auth/passkey-request → pending WebAuthn challenge (204 if none, 409 on error).
+	apiMux.HandleFunc("/auth/passkey-request", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		passkeyState.mu.Lock()
+		req, errMsg := passkeyState.request, passkeyState.errMsg
+		passkeyState.mu.Unlock()
+		if errMsg != "" {
+			respondJSON(w, http.StatusConflict, map[string]string{"error": errMsg})
+			return
+		}
+		if req == nil {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		respondJSON(w, http.StatusOK, req)
+	})
+
+	// POST /auth/passkey-response → body = WebAuthnResponse JSON; forwards to server.
+	apiMux.HandleFunc("/auth/passkey-response", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var resp types.WebAuthnResponse
+		if err := json.NewDecoder(r.Body).Decode(&resp); err != nil {
+			http.Error(w, "invalid WebAuthnResponse: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := client.SendPasskeyResponse(context.Background(), &resp); err != nil {
+			slog.Error("SendPasskeyResponse failed", "err", err.Error())
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		slog.Info("passkey response submitted to server")
+		respondJSON(w, http.StatusOK, map[string]string{"status": "sent"})
+	})
+
+	// GET /auth/passkey-code → cross-device confirmation code (204 until ready).
+	apiMux.HandleFunc("/auth/passkey-code", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		passkeyState.mu.Lock()
+		code, skip, errMsg := passkeyState.code, passkeyState.skipUX, passkeyState.errMsg
+		passkeyState.mu.Unlock()
+		if errMsg != "" {
+			respondJSON(w, http.StatusConflict, map[string]string{"error": errMsg})
+			return
+		}
+		if code == "" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"code": code, "skip_handoff_ux": skip})
+	})
+
+	// POST /auth/passkey-confirm → SendPasskeyConfirmation (finishes linking).
+	apiMux.HandleFunc("/auth/passkey-confirm", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if err := client.SendPasskeyConfirmation(context.Background()); err != nil {
+			slog.Error("SendPasskeyConfirmation failed", "err", err.Error())
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		passkeyState.mu.Lock()
+		passkeyState.request = nil
+		passkeyState.code = ""
+		passkeyState.mu.Unlock()
+		slog.Info("passkey confirmation submitted; linking should complete")
+		respondJSON(w, http.StatusOK, map[string]string{"status": "confirmed"})
+	})
+
 	// Authentication
 	protected := auth.JwtAuthMiddleware(cfg, apiMux)
 	http.Handle("/api/", http.StripPrefix("/api", protected))
@@ -4794,6 +4886,29 @@ func main() {
 			// Surface it to the number's webhook so automations can react (e.g.
 			// auto-welcome a new member). Best-effort, fire-and-forget.
 			handleGroupInfoEvent(client, v, logger)
+
+		case *events.PairPasskeyRequest:
+			passkeyState.mu.Lock()
+			passkeyState.request = v.PublicKey
+			passkeyState.code = ""
+			passkeyState.errMsg = ""
+			passkeyState.mu.Unlock()
+			slog.Info("passkey request captured; awaiting browser assertion",
+				"rpId", v.PublicKey.RelyingPartID, "uv", v.PublicKey.UserVerification,
+				"allowCreds", len(v.PublicKey.AllowCredentials))
+
+		case *events.PairPasskeyConfirmation:
+			passkeyState.mu.Lock()
+			passkeyState.code = v.Code
+			passkeyState.skipUX = v.SkipHandoffUX
+			passkeyState.mu.Unlock()
+			slog.Info("passkey confirmation code ready", "code", v.Code, "skipHandoffUX", v.SkipHandoffUX)
+
+		case *events.PairPasskeyError:
+			passkeyState.mu.Lock()
+			passkeyState.errMsg = v.Error.Error()
+			passkeyState.mu.Unlock()
+			slog.Error("passkey linking error", "err", v.Error.Error(), "continuation", v.Continuation)
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
