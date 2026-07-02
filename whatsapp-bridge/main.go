@@ -1860,6 +1860,24 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		logger.Infof("MSG-DEBUG id=%s chat=%s type=%s cat=%s raw=%s", msg.Info.ID, chatJID, msg.Info.Type, msg.Info.Category, string(b))
 	}
 
+	// Modern clients deliver OTHER parties' message edits (and poll/event edits)
+	// as an encrypted SecretEncryptedMessage — the plaintext is a BuildEdit-shaped
+	// message (EditedMessage → ProtocolMessage MESSAGE_EDIT). Decrypt in place so
+	// the protocol-message handler below applies it like a plain edit. Without
+	// this the event has no text/media and is silently dropped. Own-device edits
+	// still arrive as plain ProtocolMessage and skip this path. Decryption needs
+	// the target's MessageSecret, which whatsmeow stores on receipt — edits of
+	// messages received before this bridge existed can't decrypt (logged, skipped).
+	if sem := msg.Message.GetSecretEncryptedMessage(); sem != nil {
+		decrypted, decErr := client.DecryptSecretEncryptedMessage(context.Background(), msg)
+		if decErr != nil {
+			logger.Warnf("Failed to decrypt secret-encrypted message %s (type %s, target %s): %v",
+				msg.Info.ID, sem.GetSecretEncType().String(), sem.GetTargetMessageKey().GetID(), decErr)
+			return
+		}
+		msg.Message = decrypted
+	}
+
 	// Reactions carry no text/media, so the empty-content guard below would drop
 	// them. Persist them against their target message instead so the MCP's
 	// /messages output can surface them (empty text = the sender cleared theirs).
