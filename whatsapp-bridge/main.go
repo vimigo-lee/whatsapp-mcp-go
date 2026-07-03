@@ -252,6 +252,8 @@ func NewMessageStore() (*MessageStore, error) {
 			quoted_sender TEXT,
 			quoted_content TEXT,
 			is_forwarded BOOLEAN NOT NULL DEFAULT FALSE,
+			delivered_at TIMESTAMP,
+			read_at TIMESTAMP,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
@@ -313,6 +315,18 @@ func NewMessageStore() (*MessageStore, error) {
 		_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_forwarded BOOLEAN NOT NULL DEFAULT FALSE`)
 	} else {
 		_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN is_forwarded BOOLEAN NOT NULL DEFAULT 0`)
+	}
+
+	// Delivery-receipt stamps: set as the recipient's receipts arrive for our
+	// outgoing messages (see the *events.Receipt handler), so the board can render
+	// WhatsApp's tick states (delivered_at = double grey, read_at = double blue).
+	// NULL for pre-existing rows and for incoming messages.
+	if isPostgres {
+		_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMP`)
+		_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMP`)
+	} else {
+		_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN delivered_at TIMESTAMP`)
+		_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN read_at TIMESTAMP`)
 	}
 
 	return &MessageStore{db: db}, nil
@@ -659,6 +673,35 @@ func (store *MessageStore) SetUnreadCount(jid string, count int) error {
 	}
 	_, err := store.db.Exec(q, count, jid)
 	return err
+}
+
+// markReceipt stamps a receipt column (delivered_at | read_at) on our OUTGOING
+// messages once the recipient's receipt arrives, so the chat UI can render the
+// grey→blue tick. Scoped to is_from_me rows so an incoming message never gets a
+// spurious stamp, and only stamps once (col IS NULL) — receipts are at-least-once,
+// so a replay must not move the timestamp. A receipt can carry several IDs at once.
+// col is a fixed caller-supplied constant, never user input, so the format is safe.
+func (store *MessageStore) markReceipt(col, chatJID string, msgIDs []string, ts time.Time) error {
+	q := fmt.Sprintf("UPDATE messages SET %s = ? WHERE id = ? AND chat_jid = ? AND is_from_me = ? AND %s IS NULL", col, col)
+	if isPostgres {
+		q = fmt.Sprintf("UPDATE messages SET %s = $1 WHERE id = $2 AND chat_jid = $3 AND is_from_me = $4 AND %s IS NULL", col, col)
+	}
+	for _, id := range msgIDs {
+		if _, err := store.db.Exec(q, ts, id, chatJID, true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// MarkDelivered stamps delivered_at (double grey tick) for our outgoing messages.
+func (store *MessageStore) MarkDelivered(chatJID string, msgIDs []string, ts time.Time) error {
+	return store.markReceipt("delivered_at", chatJID, msgIDs, ts)
+}
+
+// MarkRead stamps read_at (double blue "seen" tick) for our outgoing messages.
+func (store *MessageStore) MarkRead(chatJID string, msgIDs []string, ts time.Time) error {
+	return store.markReceipt("read_at", chatJID, msgIDs, ts)
 }
 
 // MarkUnread flags a chat as unread (at least 1) without clobbering a larger
@@ -4879,6 +4922,27 @@ func main() {
 				readChat := normalizeUserJID(client, v.Chat).String()
 				if err := messageStore.SetUnreadCount(readChat, 0); err != nil {
 					logger.Warnf("Failed to clear unread on read receipt: %v", err)
+				}
+			} else if !v.IsFromMe {
+				// A receipt from the contact about our OUTGOING message(s): stamp the
+				// matching column so the board renders the grey→blue tick. Delivered =
+				// reached device (double grey); Read/Played = seen (double blue).
+				// markReceipt scopes to is_from_me rows, so an inbound message is never
+				// stamped by mistake.
+				readChat := normalizeUserJID(client, v.Chat).String()
+				ids := make([]string, len(v.MessageIDs))
+				for i, m := range v.MessageIDs {
+					ids[i] = string(m)
+				}
+				switch v.Type {
+				case types.ReceiptTypeDelivered:
+					if err := messageStore.MarkDelivered(readChat, ids, v.Timestamp); err != nil {
+						logger.Warnf("Failed to stamp delivered receipt: %v", err)
+					}
+				case types.ReceiptTypeRead, types.ReceiptTypePlayed:
+					if err := messageStore.MarkRead(readChat, ids, v.Timestamp); err != nil {
+						logger.Warnf("Failed to stamp read receipt: %v", err)
+					}
 				}
 			}
 
