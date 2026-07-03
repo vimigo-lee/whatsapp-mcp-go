@@ -254,6 +254,8 @@ func NewMessageStore() (*MessageStore, error) {
 			is_forwarded BOOLEAN NOT NULL DEFAULT FALSE,
 			delivered_at TIMESTAMP,
 			read_at TIMESTAMP,
+			failed_at TIMESTAMP,
+			failure_reason TEXT,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
@@ -327,6 +329,17 @@ func NewMessageStore() (*MessageStore, error) {
 	} else {
 		_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN delivered_at TIMESTAMP`)
 		_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN read_at TIMESTAMP`)
+	}
+
+	// Failed-delivery columns so the manager's MSG_COLS read path (which selects
+	// failed_at/failure_reason) never errors on a bridge schema. Only Cloud API
+	// numbers ever stamp these; on bridge numbers they simply stay NULL.
+	if isPostgres {
+		_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS failed_at TIMESTAMP`)
+		_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS failure_reason TEXT`)
+	} else {
+		_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN failed_at TIMESTAMP`)
+		_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN failure_reason TEXT`)
 	}
 
 	return &MessageStore{db: db}, nil
