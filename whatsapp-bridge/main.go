@@ -2187,6 +2187,17 @@ func (store *MessageStore) GetMessageSourceInfo(id, chatJID string) (string, boo
 	return sender, isFromMe, err
 }
 
+// UpdateMediaURL replaces a stored message's media URL — used when a media
+// retry response delivers a fresh direct path after the CDN copy expired.
+func (store *MessageStore) UpdateMediaURL(id, chatJID, url string) error {
+	q := "UPDATE messages SET url = ? WHERE id = ? AND chat_jid = ?"
+	if isPostgres {
+		q = "UPDATE messages SET url = $1 WHERE id = $2 AND chat_jid = $3"
+	}
+	_, err := store.db.Exec(q, url, id, chatJID)
+	return err
+}
+
 // MediaDownloader implements the whatsmeow.DownloadableMessage interface
 type MediaDownloader struct {
 	URL           string
@@ -2337,11 +2348,20 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	return true, mediaType, filename, absPath, nil
 }
 
-// pendingMediaRetries maps a message ID to the channel an in-flight download
-// request is waiting on; the MediaRetry event handler delivers the sender's
-// re-upload response through it. Also serves as an in-flight guard so a
-// message only ever has one outstanding retry request.
-var pendingMediaRetries sync.Map // string (message ID) -> chan *events.MediaRetry
+// mediaRetryWaiter is the shared state for one in-flight media retry. The
+// first download request for a message owns it (sends the receipt, waits on
+// ch, fills data/err, closes done); any concurrent request for the same
+// message joins by waiting on done and sharing the result instead of sending
+// a duplicate retry receipt.
+type mediaRetryWaiter struct {
+	ch   chan *events.MediaRetry // event handler delivers the response here
+	done chan struct{}           // closed by the owner once data/err are set
+	data []byte
+	err  error
+}
+
+// pendingMediaRetries maps a message ID to its in-flight mediaRetryWaiter.
+var pendingMediaRetries sync.Map // string (message ID) -> *mediaRetryWaiter
 
 // mediaRetryTimeout is how long a download request waits for the sender's
 // device to answer a media retry receipt before giving up (the device may be
@@ -2361,6 +2381,26 @@ func isExpiredMediaErr(err error) bool {
 // original sender's device to re-upload the file, waits for the MediaRetry
 // notification, and re-downloads from the fresh direct path it carries.
 func retryExpiredMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string, d *MediaDownloader) ([]byte, error) {
+	w := &mediaRetryWaiter{ch: make(chan *events.MediaRetry, 1), done: make(chan struct{})}
+	if existing, inFlight := pendingMediaRetries.LoadOrStore(messageID, w); inFlight {
+		// Another request already asked the sender's device to re-upload this
+		// message's media — join its wait and share the outcome instead of
+		// erroring out or sending a duplicate retry receipt.
+		ew := existing.(*mediaRetryWaiter)
+		<-ew.done
+		return ew.data, ew.err
+	}
+	defer func() {
+		pendingMediaRetries.Delete(messageID)
+		close(w.done)
+	}()
+	w.data, w.err = performMediaRetry(client, messageStore, messageID, chatJID, d, w.ch)
+	return w.data, w.err
+}
+
+// performMediaRetry does the actual receipt send + wait + re-download for the
+// owning request; joiners never enter here.
+func performMediaRetry(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string, d *MediaDownloader, ch chan *events.MediaRetry) ([]byte, error) {
 	sender, isFromMe, err := messageStore.GetMessageSourceInfo(messageID, chatJID)
 	if err != nil {
 		return nil, fmt.Errorf("media expired on WhatsApp's servers and sender lookup failed: %v", err)
@@ -2378,12 +2418,6 @@ func retryExpiredMedia(client *whatsmeow.Client, messageStore *MessageStore, mes
 		},
 		ID: messageID,
 	}
-
-	ch := make(chan *events.MediaRetry, 1)
-	if _, inFlight := pendingMediaRetries.LoadOrStore(messageID, ch); inFlight {
-		return nil, fmt.Errorf("media expired; a re-upload request is already in progress — try again shortly")
-	}
-	defer pendingMediaRetries.Delete(messageID)
 
 	if err := client.SendMediaRetryReceipt(context.Background(), info, d.MediaKey); err != nil {
 		return nil, fmt.Errorf("media expired and the re-upload request failed to send: %v", err)
@@ -2414,6 +2448,39 @@ func retryExpiredMedia(client *whatsmeow.Client, messageStore *MessageStore, mes
 	case <-time.After(mediaRetryTimeout):
 		return nil, fmt.Errorf("media expired; asked the sender's device to re-upload but got no response yet (device may be offline) — try again in a minute")
 	}
+}
+
+// handleMediaRetryResponse processes a sender's answer to a media retry
+// receipt. It hands the event to the download request waiting on it (if any),
+// and independently persists the fresh direct path into the message row — so
+// an answer that arrives after the waiter timed out isn't lost: the next
+// download attempt uses the refreshed path and succeeds without a new
+// round-trip to the sender's device.
+func handleMediaRetryResponse(client *whatsmeow.Client, messageStore *MessageStore, evt *events.MediaRetry) {
+	msgID := string(evt.MessageID)
+	if w, ok := pendingMediaRetries.Load(msgID); ok {
+		select {
+		case w.(*mediaRetryWaiter).ch <- evt:
+		default:
+		}
+	}
+
+	chatJID := normalizeUserJID(client, evt.ChatID).String()
+	_, _, _, mediaKey, _, _, _, err := messageStore.GetMediaInfo(msgID, chatJID)
+	if err != nil || len(mediaKey) == 0 {
+		return
+	}
+	notif, err := whatsmeow.DecryptMediaRetryNotification(evt, mediaKey)
+	if err != nil || notif.GetResult() != waMmsRetry.MediaRetryNotification_SUCCESS || notif.GetDirectPath() == "" {
+		return
+	}
+	if err := messageStore.UpdateMediaURL(msgID, chatJID, notif.GetDirectPath()); err != nil {
+		slog.Warn("failed to persist refreshed media path from retry response",
+			"message_id", msgID, "chat_jid", chatJID, "error", err)
+		return
+	}
+	slog.Info("persisted refreshed media path from retry response",
+		"message_id", msgID, "chat_jid", chatJID)
 }
 
 func extractDirectPathFromURL(url string) string {
@@ -5085,14 +5152,9 @@ func main() {
 
 		case *events.MediaRetry:
 			// Response to a media retry receipt we sent for expired CDN media.
-			// Hand it to the download request waiting on this message, if any
-			// (an unsolicited or late response is simply dropped).
-			if ch, ok := pendingMediaRetries.Load(string(v.MessageID)); ok {
-				select {
-				case ch.(chan *events.MediaRetry) <- v:
-				default:
-				}
-			}
+			// Feeds any waiting download request AND persists the refreshed
+			// direct path so late answers still fix the next attempt.
+			handleMediaRetryResponse(client, messageStore, v)
 
 		case *events.GroupInfo:
 			// Membership / role change in a group we're in (someone added,
