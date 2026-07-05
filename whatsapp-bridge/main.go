@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -45,6 +46,7 @@ import (
 	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
+	"go.mau.fi/whatsmeow/proto/waMmsRetry"
 	"go.mau.fi/whatsmeow/proto/waWeb"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -2165,6 +2167,26 @@ func (store *MessageStore) GetMediaInfo(id, chatJID string) (string, string, str
 	return mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, err
 }
 
+// GetMessageSourceInfo returns the sender (phone user part) and direction of a
+// stored message — the bits needed to address a media retry receipt.
+func (store *MessageStore) GetMessageSourceInfo(id, chatJID string) (string, bool, error) {
+	var sender string
+	var isFromMe bool
+	var err error
+	if isPostgres {
+		err = store.db.QueryRow(
+			`SELECT sender, is_from_me FROM messages WHERE id = $1 AND chat_jid = $2`,
+			id, chatJID,
+		).Scan(&sender, &isFromMe)
+	} else {
+		err = store.db.QueryRow(
+			"SELECT sender, is_from_me FROM messages WHERE id = ? AND chat_jid = ?",
+			id, chatJID,
+		).Scan(&sender, &isFromMe)
+	}
+	return sender, isFromMe, err
+}
+
 // MediaDownloader implements the whatsmeow.DownloadableMessage interface
 type MediaDownloader struct {
 	URL           string
@@ -2296,7 +2318,15 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 
 	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
-		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
+		// 403/404/410 mean the encrypted blob has expired off WhatsApp's CDN.
+		// Ask the sender's device to re-upload it (silent protocol receipt) and
+		// retry from the fresh direct path before giving up.
+		if isExpiredMediaErr(err) {
+			mediaData, err = retryExpiredMedia(client, messageStore, messageID, chatJID, downloader)
+		}
+		if err != nil {
+			return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
+		}
 	}
 
 	if err := os.WriteFile(localPath, mediaData, 0644); err != nil {
@@ -2305,6 +2335,85 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 
 	slog.Info("successfully downloaded media", "media_type", mediaType, "path", absPath, "bytes", len(mediaData))
 	return true, mediaType, filename, absPath, nil
+}
+
+// pendingMediaRetries maps a message ID to the channel an in-flight download
+// request is waiting on; the MediaRetry event handler delivers the sender's
+// re-upload response through it. Also serves as an in-flight guard so a
+// message only ever has one outstanding retry request.
+var pendingMediaRetries sync.Map // string (message ID) -> chan *events.MediaRetry
+
+// mediaRetryTimeout is how long a download request waits for the sender's
+// device to answer a media retry receipt before giving up (the device may be
+// offline; the response can still arrive later and a later request retries).
+const mediaRetryTimeout = 30 * time.Second
+
+// isExpiredMediaErr reports whether a download failure means the encrypted
+// blob is gone from WhatsApp's CDN, which a media retry receipt can fix.
+func isExpiredMediaErr(err error) bool {
+	return errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith403) ||
+		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith404) ||
+		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410)
+}
+
+// retryExpiredMedia handles expired CDN media: it sends a media retry receipt
+// (an invisible protocol stanza — nothing appears in the chat) asking the
+// original sender's device to re-upload the file, waits for the MediaRetry
+// notification, and re-downloads from the fresh direct path it carries.
+func retryExpiredMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string, d *MediaDownloader) ([]byte, error) {
+	sender, isFromMe, err := messageStore.GetMessageSourceInfo(messageID, chatJID)
+	if err != nil {
+		return nil, fmt.Errorf("media expired on WhatsApp's servers and sender lookup failed: %v", err)
+	}
+	chat, err := types.ParseJID(chatJID)
+	if err != nil {
+		return nil, fmt.Errorf("media expired on WhatsApp's servers and chat JID is invalid: %v", err)
+	}
+	info := &types.MessageInfo{
+		MessageSource: types.MessageSource{
+			Chat:     chat,
+			Sender:   types.NewJID(sender, types.DefaultUserServer),
+			IsFromMe: isFromMe,
+			IsGroup:  chat.Server == types.GroupServer,
+		},
+		ID: messageID,
+	}
+
+	ch := make(chan *events.MediaRetry, 1)
+	if _, inFlight := pendingMediaRetries.LoadOrStore(messageID, ch); inFlight {
+		return nil, fmt.Errorf("media expired; a re-upload request is already in progress — try again shortly")
+	}
+	defer pendingMediaRetries.Delete(messageID)
+
+	if err := client.SendMediaRetryReceipt(context.Background(), info, d.MediaKey); err != nil {
+		return nil, fmt.Errorf("media expired and the re-upload request failed to send: %v", err)
+	}
+	slog.Info("media expired on CDN; requested re-upload from sender's device",
+		"message_id", messageID, "chat_jid", chatJID, "from_me", isFromMe)
+
+	select {
+	case evt := <-ch:
+		notif, decErr := whatsmeow.DecryptMediaRetryNotification(evt, d.MediaKey)
+		if decErr != nil {
+			if errors.Is(decErr, whatsmeow.ErrMediaNotAvailableOnPhone) {
+				return nil, fmt.Errorf("media expired and the sender's device no longer has the file")
+			}
+			return nil, fmt.Errorf("media expired and the retry response could not be decrypted: %v", decErr)
+		}
+		if notif.GetResult() != waMmsRetry.MediaRetryNotification_SUCCESS || notif.GetDirectPath() == "" {
+			return nil, fmt.Errorf("media expired and the sender's device could not re-upload it (result: %s)", notif.GetResult())
+		}
+		data, dlErr := client.DownloadMediaWithPath(context.Background(),
+			notif.GetDirectPath(), d.FileEncSHA256, d.FileSHA256, d.MediaKey, d.MediaType, "", false)
+		if dlErr != nil {
+			return nil, fmt.Errorf("re-download after media retry failed: %v", dlErr)
+		}
+		slog.Info("media retry succeeded; downloaded re-uploaded media",
+			"message_id", messageID, "bytes", len(data))
+		return data, nil
+	case <-time.After(mediaRetryTimeout):
+		return nil, fmt.Errorf("media expired; asked the sender's device to re-upload but got no response yet (device may be offline) — try again in a minute")
+	}
 }
 
 func extractDirectPathFromURL(url string) string {
@@ -4971,6 +5080,17 @@ func main() {
 			} else if v.Action != nil {
 				if err := messageStore.MarkUnread(markChat); err != nil {
 					logger.Warnf("Failed to mark unread: %v", err)
+				}
+			}
+
+		case *events.MediaRetry:
+			// Response to a media retry receipt we sent for expired CDN media.
+			// Hand it to the download request waiting on this message, if any
+			// (an unsolicited or late response is simply dropped).
+			if ch, ok := pendingMediaRetries.Load(string(v.MessageID)); ok {
+				select {
+				case ch.(chan *events.MediaRetry) <- v:
+				default:
 				}
 			}
 
