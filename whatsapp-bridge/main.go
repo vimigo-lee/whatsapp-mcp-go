@@ -656,8 +656,34 @@ func migrateLIDChatsToPhoneJIDs(
 	)
 }
 
+// maxFutureSkew is how far ahead of our own clock a WhatsApp-supplied timestamp
+// may sit before we stop believing it. Generous enough to absorb real clock drift
+// between us, the sender's phone and WhatsApp's servers; far tighter than the
+// decades-off values WhatsApp occasionally emits.
+const maxFutureSkew = 24 * time.Hour
+
+// sanitizeTimestamp guards the store against nonsense timestamps from WhatsApp.
+// History sync in particular has been observed handing us a fixed sentinel date
+// (e.g. 2101-05-16) instead of the real send time. Such a row sorts to the top of
+// every chat forever AND never ages out of retention (which prunes rows OLDER than
+// the cutoff), so it is effectively immortal.
+//
+// We fall back to arrival time — not a guess at the true send time, just a bounded
+// upper bound we actually know: the message cannot have been sent after we received
+// it. A zero time gets the same treatment. `what` names the caller for the log line.
+func sanitizeTimestamp(ts time.Time, what, ref string) time.Time {
+	now := time.Now()
+	if ts.IsZero() || ts.After(now.Add(maxFutureSkew)) {
+		fmt.Printf("[store] implausible %s timestamp %s for %s — using arrival time %s\n",
+			what, ts.Format(time.RFC3339), ref, now.Format(time.RFC3339))
+		return now
+	}
+	return ts
+}
+
 // StoreChat Store a chat in the database
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
+	lastMessageTime = sanitizeTimestamp(lastMessageTime, "chat", jid)
 	if isPostgres {
 		_, err := store.db.Exec(
 			`INSERT INTO chats (jid, name, last_message_time) 
@@ -764,6 +790,8 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 	if content == "" && mediaType == "" {
 		return nil
 	}
+
+	timestamp = sanitizeTimestamp(timestamp, "message", id)
 
 	if !isPostgres {
 		_, err := store.db.Exec(
