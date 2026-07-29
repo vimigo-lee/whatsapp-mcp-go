@@ -783,6 +783,17 @@ func (store *MessageStore) LatestIncoming(chatJID string) (id string, sender str
 	return id, sender, id != ""
 }
 
+
+// LatestAnywhere returns the most recent stored message across all chats —
+// the anchor whatsmeow now requires for on-demand history sync requests.
+func (store *MessageStore) LatestAnywhere() (id, chatJID string, isFromMe bool, ts time.Time, ok bool) {
+	q := "SELECT id, chat_jid, is_from_me, timestamp FROM messages ORDER BY timestamp DESC LIMIT 1"
+	if err := store.db.QueryRow(q).Scan(&id, &chatJID, &isFromMe, &ts); err != nil {
+		return "", "", false, time.Time{}, false
+	}
+	return id, chatJID, isFromMe, ts, id != ""
+}
+
 // StoreMessage Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
 	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64,
@@ -2890,7 +2901,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 			respondError(w, http.StatusConflict, "not connected")
 			return
 		}
-		go requestHistorySync(client)
+		go requestHistorySync(client, messageStore)
 		go func() {
 			for _, name := range []appstate.WAPatchName{appstate.WAPatchRegular, appstate.WAPatchRegularHigh, appstate.WAPatchRegularLow} {
 				if err := client.FetchAppState(context.Background(), name, true, false); err != nil {
@@ -4063,7 +4074,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 }
 
 // Request history sync from the server
-func requestHistorySync(client *whatsmeow.Client) {
+func requestHistorySync(client *whatsmeow.Client, messageStore *MessageStore) {
 	if client == nil {
 		slog.Error("client is not initialized, cannot request history sync")
 		return
@@ -4079,7 +4090,33 @@ func requestHistorySync(client *whatsmeow.Client) {
 		return
 	}
 
-	historyMsg := client.BuildHistorySyncRequest(nil, 100)
+	// whatsmeow ≥ 2026-05 (pin eb05d94) dereferences lastKnownMessageInfo
+	// unconditionally in BuildHistorySyncRequest — passing nil panics and takes
+	// the whole bridge down (supervisor restart storm on every /resync). The
+	// old nil call built a "global" on-demand request; that contract is gone.
+	// Anchor the request on the most recent message we have; without one there
+	// is nothing valid to request, so skip — the FetchAppState refetch in the
+	// /resync handler still replays read/unread markers.
+	if messageStore == nil {
+		slog.Warn("history sync skipped: no message store")
+		return
+	}
+	id, chatJID, isFromMe, ts, ok := messageStore.LatestAnywhere()
+	if !ok {
+		slog.Warn("history sync skipped: no anchor message for BuildHistorySyncRequest (nil would panic)")
+		return
+	}
+	jid, jidErr := types.ParseJID(chatJID)
+	if jidErr != nil {
+		slog.Warn("history sync skipped: bad anchor chat jid", "jid", chatJID, "err", jidErr)
+		return
+	}
+	lastKnown := &types.MessageInfo{
+		MessageSource: types.MessageSource{Chat: jid, IsFromMe: isFromMe},
+		ID:            id,
+		Timestamp:     ts,
+	}
+	historyMsg := client.BuildHistorySyncRequest(lastKnown, 100)
 	if historyMsg == nil {
 		slog.Error("failed to build history sync request")
 		return
