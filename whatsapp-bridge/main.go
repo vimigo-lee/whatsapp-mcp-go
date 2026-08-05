@@ -4122,10 +4122,7 @@ func requestHistorySync(client *whatsmeow.Client, messageStore *MessageStore) {
 		return
 	}
 
-	_, err := client.SendMessage(context.Background(), types.JID{
-		Server: "s.whatsapp.net",
-		User:   "status",
-	}, historyMsg)
+	_, err := client.SendPeerMessage(context.Background(), historyMsg)
 
 	if err != nil {
 		slog.Error("failed to request history sync", "err", err)
