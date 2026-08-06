@@ -9,6 +9,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/jpeg"
+	_ "image/png"
 	"io"
 	"log"
 	"log/slog"
@@ -3386,6 +3389,47 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 		respondJSON(w, http.StatusOK, map[string]interface{}{"ok": true})
 	})
 
+	// POST /api/group/photo  { "jid": "...@g.us", "photo_base64": "<jpeg/png>", "remove": false }
+	// Sets (or clears) the group profile picture. WhatsApp expects JPEG; non-JPEG
+	// images are re-encoded. photo_base64 empty + remove=true clears the photo.
+	apiMux.HandleFunc("/group/photo", func(w http.ResponseWriter, r *http.Request) {
+		gjid, ok := decodeGroupJID(w, r)
+		if !ok {
+			return
+		}
+		var req struct {
+			PhotoBase64 string `json:"photo_base64"`
+			Remove      bool   `json:"remove"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		var avatar []byte
+		if req.Remove || strings.TrimSpace(req.PhotoBase64) == "" {
+			if !req.Remove && strings.TrimSpace(req.PhotoBase64) == "" {
+				respondError(w, http.StatusBadRequest, "photo_base64 is required (or set remove=true)")
+				return
+			}
+			avatar = nil
+		} else {
+			raw, err := base64.StdEncoding.DecodeString(req.PhotoBase64)
+			if err != nil {
+				respondError(w, http.StatusBadRequest, "invalid photo_base64")
+				return
+			}
+			jpegBytes, err := toGroupPhotoJPEG(raw)
+			if err != nil {
+				respondError(w, http.StatusBadRequest, fmt.Sprintf("invalid image: %v", err))
+				return
+			}
+			avatar = jpegBytes
+		}
+		pictureID, err := client.SetGroupPhoto(context.Background(), gjid, avatar)
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, fmt.Sprintf("failed to set photo: %v", err))
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "picture_id": pictureID})
+	})
+
 	// POST /api/group/announce  { "jid": "...@g.us", "announce": true }
 	// announce=true → only admins can send messages.
 	apiMux.HandleFunc("/group/announce", func(w http.ResponseWriter, r *http.Request) {
@@ -3722,6 +3766,26 @@ func respondError(w http.ResponseWriter, status int, msg string) {
 	respondJSON(w, status, map[string]string{
 		"error": msg,
 	})
+}
+
+// toGroupPhotoJPEG normalizes arbitrary image bytes to JPEG for SetGroupPhoto.
+// Already-JPEG payloads pass through; PNG/etc. are decoded and re-encoded.
+func toGroupPhotoJPEG(data []byte) ([]byte, error) {
+	if len(data) >= 2 && data[0] == 0xff && data[1] == 0xd8 {
+		return data, nil
+	}
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 85}); err != nil {
+		return nil, err
+	}
+	if buf.Len() == 0 {
+		return nil, fmt.Errorf("empty jpeg")
+	}
+	return buf.Bytes(), nil
 }
 
 // parseParticipantJID turns a caller-supplied identifier into a types.JID.
