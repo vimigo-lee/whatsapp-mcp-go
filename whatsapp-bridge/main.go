@@ -278,6 +278,20 @@ func NewMessageStore() (*MessageStore, error) {
 			timestamp TIMESTAMP,
 			PRIMARY KEY (msg_id, sender)
 		);
+
+		-- WhatsApp Business chat labels (app-state LabelEdit / LabelAssociationChat).
+		-- Read-only mirror for the manager UI; applied on the phone, synced here.
+		CREATE TABLE IF NOT EXISTS wa_labels (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL DEFAULT '',
+			color INTEGER NOT NULL DEFAULT 0,
+			deleted BOOLEAN NOT NULL DEFAULT FALSE
+		);
+		CREATE TABLE IF NOT EXISTS wa_chat_labels (
+			chat_jid TEXT NOT NULL,
+			label_id TEXT NOT NULL,
+			PRIMARY KEY (chat_jid, label_id)
+		);
 	`, blobType, blobType, blobType))
 	if err != nil {
 		db.Close()
@@ -757,6 +771,73 @@ func (store *MessageStore) MarkUnread(jid string) error {
 		q = "UPDATE chats SET unread_count = GREATEST(unread_count, 1) WHERE jid = $1"
 	}
 	_, err := store.db.Exec(q, jid)
+	return err
+}
+
+// UpsertWaLabel creates or updates a WhatsApp Business label definition.
+func (store *MessageStore) UpsertWaLabel(id, name string, color int32, deleted bool) error {
+	if isPostgres {
+		_, err := store.db.Exec(
+			`INSERT INTO wa_labels (id, name, color, deleted)
+			 VALUES ($1, $2, $3, $4)
+			 ON CONFLICT (id) DO UPDATE SET
+			   name = EXCLUDED.name,
+			   color = EXCLUDED.color,
+			   deleted = EXCLUDED.deleted`,
+			id, name, color, deleted,
+		)
+		return err
+	}
+	_, err := store.db.Exec(
+		`INSERT INTO wa_labels (id, name, color, deleted) VALUES (?, ?, ?, ?)
+		 ON CONFLICT(id) DO UPDATE SET
+		   name = excluded.name,
+		   color = excluded.color,
+		   deleted = excluded.deleted`,
+		id, name, color, deleted,
+	)
+	return err
+}
+
+// DeleteWaLabel soft-deletes a label and clears its chat associations.
+func (store *MessageStore) DeleteWaLabel(id string) error {
+	if isPostgres {
+		if _, err := store.db.Exec(`UPDATE wa_labels SET deleted = TRUE WHERE id = $1`, id); err != nil {
+			return err
+		}
+		_, err := store.db.Exec(`DELETE FROM wa_chat_labels WHERE label_id = $1`, id)
+		return err
+	}
+	if _, err := store.db.Exec(`UPDATE wa_labels SET deleted = 1 WHERE id = ?`, id); err != nil {
+		return err
+	}
+	_, err := store.db.Exec(`DELETE FROM wa_chat_labels WHERE label_id = ?`, id)
+	return err
+}
+
+// SetWaChatLabel adds or removes a label association on a chat.
+func (store *MessageStore) SetWaChatLabel(chatJID, labelID string, labeled bool) error {
+	if !labeled {
+		q := "DELETE FROM wa_chat_labels WHERE chat_jid = ? AND label_id = ?"
+		if isPostgres {
+			q = "DELETE FROM wa_chat_labels WHERE chat_jid = $1 AND label_id = $2"
+		}
+		_, err := store.db.Exec(q, chatJID, labelID)
+		return err
+	}
+	if isPostgres {
+		_, err := store.db.Exec(
+			`INSERT INTO wa_chat_labels (chat_jid, label_id) VALUES ($1, $2)
+			 ON CONFLICT (chat_jid, label_id) DO NOTHING`,
+			chatJID, labelID,
+		)
+		return err
+	}
+	_, err := store.db.Exec(
+		`INSERT INTO wa_chat_labels (chat_jid, label_id) VALUES (?, ?)
+		 ON CONFLICT(chat_jid, label_id) DO NOTHING`,
+		chatJID, labelID,
+	)
 	return err
 }
 
@@ -2893,8 +2974,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 
 	// Manual chat resync — re-request history (re-seeds unread counts from
 	// WhatsApp's own per-chat numbers) and re-fetch app state (replays read /
-	// unread markers via the MarkChatAsRead handler). Both run async; the data
-	// lands through the normal event handlers shortly after.
+	// unread markers via MarkChatAsRead, and WA Business labels via LabelEdit /
+	// LabelAssociationChat when EmitAppStateEventsOnFullSync is set). Both run
+	// async; the data lands through the normal event handlers shortly after.
 	apiMux.HandleFunc("/resync", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -5166,6 +5248,9 @@ func main() {
 		logger.Errorf("Failed to create WhatsApp client")
 		return
 	}
+	// Replay LabelEdit / LabelAssociationChat (and MarkChatAsRead) during full
+	// FetchAppState so /resync and login rehydrate WA Business labels into PG.
+	client.EmitAppStateEventsOnFullSync = true
 
 	// Per-number outbound proxy for WhatsApp traffic. Set by the supervisor via
 	// PROXY_URL (socks5://, http://, or https://). Must be configured before
@@ -5275,6 +5360,27 @@ func main() {
 				if err := messageStore.MarkUnread(markChat); err != nil {
 					logger.Warnf("Failed to mark unread: %v", err)
 				}
+			}
+
+		case *events.LabelEdit:
+			// WA Business label create/rename/color/delete from any linked device.
+			if v.Action == nil {
+				break
+			}
+			if v.Action.GetDeleted() {
+				if err := messageStore.DeleteWaLabel(v.LabelID); err != nil {
+					logger.Warnf("Failed to delete WA label %s: %v", v.LabelID, err)
+				}
+			} else if err := messageStore.UpsertWaLabel(v.LabelID, v.Action.GetName(), v.Action.GetColor(), false); err != nil {
+				logger.Warnf("Failed to upsert WA label %s: %v", v.LabelID, err)
+			}
+
+		case *events.LabelAssociationChat:
+			// Chat tagged/untagged with a WA Business label on any linked device.
+			chatJID := normalizeUserJID(client, v.JID).String()
+			labeled := v.Action != nil && v.Action.GetLabeled()
+			if err := messageStore.SetWaChatLabel(chatJID, v.LabelID, labeled); err != nil {
+				logger.Warnf("Failed to set WA chat label %s on %s: %v", v.LabelID, chatJID, err)
 			}
 
 		case *events.MediaRetry:
