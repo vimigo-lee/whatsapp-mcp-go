@@ -78,6 +78,7 @@ type Chat struct {
 	LastMessage     string    `json:"last_message,omitempty"`
 	LastSender      string    `json:"last_sender,omitempty"`
 	LastIsFromMe    bool      `json:"last_is_from_me,omitempty"`
+	UnreadCount     int       `json:"unread_count"`
 }
 
 func (c *Chat) IsGroup() bool {
@@ -3087,6 +3088,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 		page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 		sortBy := r.URL.Query().Get("sort")
+		unreadOnly := r.URL.Query().Get("unread_only") == "true"
 
 		if limit < 1 {
 			limit = 30
@@ -3104,6 +3106,16 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 		if err != nil {
 			respondError(w, http.StatusInternalServerError, err.Error())
 			return
+		}
+
+		if unreadOnly {
+			kept := chats[:0]
+			for _, c := range chats {
+				if c.UnreadCount > 0 {
+					kept = append(kept, c)
+				}
+			}
+			chats = kept
 		}
 
 		respondJSON(w, http.StatusOK, map[string]interface{}{
@@ -4796,7 +4808,7 @@ func (store *MessageStore) ListChats(
 
 	q := `
         SELECT 
-            c.jid, c.name, c.last_message_time,
+            c.jid, c.name, c.last_message_time, c.unread_count,
             m.content AS last_message,
             m.sender AS last_sender,
             m.is_from_me AS last_is_from_me
@@ -4855,17 +4867,18 @@ func (store *MessageStore) ListChats(
 			jid         string
 			name        sql.NullString
 			lastMsgTime sql.NullTime
+			unreadCount int
 			lastMsg     sql.NullString
 			lastSender  sql.NullString
 			lastFromMe  sql.NullBool
 		)
 
-		if err := rows.Scan(&jid, &name, &lastMsgTime, &lastMsg, &lastSender, &lastFromMe); err != nil {
+		if err := rows.Scan(&jid, &name, &lastMsgTime, &unreadCount, &lastMsg, &lastSender, &lastFromMe); err != nil {
 			log.Printf("list_chats scan error: %v", err)
 			continue
 		}
 
-		c := Chat{JID: jid}
+		c := Chat{JID: jid, UnreadCount: unreadCount}
 
 		if name.Valid {
 			c.Name = name.String
