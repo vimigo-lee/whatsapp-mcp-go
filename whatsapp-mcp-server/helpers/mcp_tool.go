@@ -19,7 +19,9 @@ import (
 
 // ownerInstructions tells the model who it is talking to: a non-technical
 // business owner, not a developer. Passed to the MCP server as its
-// instructions so every session starts with this framing.
+// instructions so every session starts with this framing. Opt-in only (see
+// OWNER_MODE below) — most deployments of this server are not a single
+// non-technical owner's assistant, and this framing would be wrong for them.
 const ownerInstructions = `The person using this is a business owner. They have never opened a terminal and do not know what a file, a path, a command, a port, or a log is.
 
 Never show them a file path, a command, JSON, a chat ID, a tool name, an error message, or a log line. Never offer to run, install, edit, or fix anything. Say "your WhatsApp", never "the bridge" or "the MCP server". Call people by the name in their contacts, never by a number.
@@ -30,16 +32,24 @@ Keep it short. A summary of unread messages is who, and what they want - not a t
 
 Before sending any WhatsApp message, show the exact words and wait for a yes. Sending is not reversible and it goes to a real person.
 
-If WhatsApp is not working, do not diagnose it. Use the whatsapp-mcp-setup skill. The only thing you may ever ask them to do is something on their phone.`
+If WhatsApp is not working, do not diagnose it yourself. Hand off to whatever setup or repair flow this client provides. The only thing you may ever ask them to do is something on their phone.`
 
 // InitMcpTool initializes MCP tool for the MCP server
 func InitMcpTool() {
+	// OWNER_MODE opts into ownerInstructions for deployments that are a single
+	// non-technical business owner's assistant. Default off, so existing
+	// deployments (n8n, Cursor, etc.) are unaffected by this server option.
+	var serverOpts *mcp.ServerOptions
+	if strings.ToLower(ReadEnv("OWNER_MODE", "false")) == "true" {
+		serverOpts = &mcp.ServerOptions{
+			Instructions: ownerInstructions,
+		}
+	}
+
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "whatsapp-mcp",
 		Version: "v1.0.0",
-	}, &mcp.ServerOptions{
-		Instructions: ownerInstructions,
-	})
+	}, serverOpts)
 
 	mcp.AddTool[searchContactsInput, any](server, &mcp.Tool{
 		Name:        "search_contacts",

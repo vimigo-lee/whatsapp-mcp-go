@@ -3102,20 +3102,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 			queryPtr = &q
 		}
 
-		chats, err := messageStore.ListChats(queryPtr, limit, page, true, sortBy)
+		chats, err := messageStore.ListChats(queryPtr, limit, page, true, sortBy, unreadOnly)
 		if err != nil {
 			respondError(w, http.StatusInternalServerError, err.Error())
 			return
-		}
-
-		if unreadOnly {
-			kept := chats[:0]
-			for _, c := range chats {
-				if c.UnreadCount > 0 {
-					kept = append(kept, c)
-				}
-			}
-			chats = kept
 		}
 
 		respondJSON(w, http.StatusOK, map[string]interface{}{
@@ -4797,6 +4787,7 @@ func (store *MessageStore) ListChats(
 	limit, page int,
 	includeLastMessage bool,
 	sortBy string,
+	unreadOnly bool,
 ) ([]Chat, error) {
 
 	placeholder := func(n int) string {
@@ -4833,6 +4824,10 @@ func (store *MessageStore) ListChats(
 			where = append(where, "(LOWER(c.name) LIKE LOWER(?) OR c.jid LIKE ?)")
 		}
 		args = append(args, "%"+*query+"%", "%"+*query+"%")
+	}
+
+	if unreadOnly {
+		where = append(where, "c.unread_count > 0")
 	}
 
 	if len(where) > 0 {
@@ -4966,7 +4961,7 @@ func (store *MessageStore) GetContactChats(jid string, limit, page int) ([]Chat,
 
 	q := `
         SELECT DISTINCT
-            c.jid, c.name, c.last_message_time,
+            c.jid, c.name, c.last_message_time, c.unread_count,
             m.content AS last_message,
             m.sender AS last_sender,
             m.is_from_me AS last_is_from_me
@@ -4990,19 +4985,20 @@ func (store *MessageStore) GetContactChats(jid string, limit, page int) ([]Chat,
 
 	for rows.Next() {
 		var (
-			cjid    string
-			name    sql.NullString
-			lmt     sql.NullTime
-			lmsg    sql.NullString
-			lsender sql.NullString
-			lfromme sql.NullBool
+			cjid        string
+			name        sql.NullString
+			lmt         sql.NullTime
+			unreadCount int
+			lmsg        sql.NullString
+			lsender     sql.NullString
+			lfromme     sql.NullBool
 		)
 
-		if err := rows.Scan(&cjid, &name, &lmt, &lmsg, &lsender, &lfromme); err != nil {
+		if err := rows.Scan(&cjid, &name, &lmt, &unreadCount, &lmsg, &lsender, &lfromme); err != nil {
 			continue
 		}
 
-		c := Chat{JID: cjid}
+		c := Chat{JID: cjid, UnreadCount: unreadCount}
 
 		if name.Valid {
 			c.Name = name.String
@@ -5095,7 +5091,7 @@ func (store *MessageStore) GetChat(chatJID string, includeLastMessage bool) (*Ch
 
 	q := `
         SELECT 
-            c.jid, c.name, c.last_message_time,
+            c.jid, c.name, c.last_message_time, c.unread_count,
             m.content AS last_message,
             m.sender AS last_sender,
             m.is_from_me AS last_is_from_me
@@ -5115,22 +5111,23 @@ func (store *MessageStore) GetChat(chatJID string, includeLastMessage bool) (*Ch
 	row := store.db.QueryRow(q, chatJID)
 
 	var (
-		jid     string
-		name    sql.NullString
-		lmt     sql.NullTime
-		lmsg    sql.NullString
-		lsender sql.NullString
-		lfromme sql.NullBool
+		jid         string
+		name        sql.NullString
+		lmt         sql.NullTime
+		unreadCount int
+		lmsg        sql.NullString
+		lsender     sql.NullString
+		lfromme     sql.NullBool
 	)
 
-	if err := row.Scan(&jid, &name, &lmt, &lmsg, &lsender, &lfromme); err != nil {
+	if err := row.Scan(&jid, &name, &lmt, &unreadCount, &lmsg, &lsender, &lfromme); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
 		return nil, err
 	}
 
-	c := Chat{JID: jid}
+	c := Chat{JID: jid, UnreadCount: unreadCount}
 
 	if name.Valid {
 		c.Name = name.String
@@ -5161,7 +5158,7 @@ func (store *MessageStore) GetDirectChatByContact(phone string) (*Chat, error) {
 
 	q := `
        SELECT 
-           c.jid, c.name, c.last_message_time,
+           c.jid, c.name, c.last_message_time, c.unread_count,
            m.content AS last_message,
            m.sender AS last_sender,
            m.is_from_me AS last_is_from_me
@@ -5179,15 +5176,16 @@ func (store *MessageStore) GetDirectChatByContact(phone string) (*Chat, error) {
 	row := store.db.QueryRow(q, arg)
 
 	var (
-		jid     string
-		name    sql.NullString
-		lmt     sql.NullTime
-		lmsg    sql.NullString
-		lsender sql.NullString
-		lfromme sql.NullBool
+		jid         string
+		name        sql.NullString
+		lmt         sql.NullTime
+		unreadCount int
+		lmsg        sql.NullString
+		lsender     sql.NullString
+		lfromme     sql.NullBool
 	)
 
-	if err := row.Scan(&jid, &name, &lmt, &lmsg, &lsender, &lfromme); err != nil {
+	if err := row.Scan(&jid, &name, &lmt, &unreadCount, &lmsg, &lsender, &lfromme); err != nil {
 		return nil, err
 	}
 
@@ -5198,6 +5196,7 @@ func (store *MessageStore) GetDirectChatByContact(phone string) (*Chat, error) {
 		LastMessage:     lmsg.String,
 		LastSender:      lsender.String,
 		LastIsFromMe:    lfromme.Bool,
+		UnreadCount:     unreadCount,
 	}, nil
 }
 
