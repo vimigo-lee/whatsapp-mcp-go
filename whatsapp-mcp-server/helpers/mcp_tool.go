@@ -17,12 +17,39 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+// ownerInstructions tells the model who it is talking to: a non-technical
+// business owner, not a developer. Passed to the MCP server as its
+// instructions so every session starts with this framing. Opt-in only (see
+// OWNER_MODE below) — most deployments of this server are not a single
+// non-technical owner's assistant, and this framing would be wrong for them.
+const ownerInstructions = `The person using this is a business owner. They have never opened a terminal and do not know what a file, a path, a command, a port, or a log is.
+
+Never show them a file path, a command, JSON, a chat ID, a tool name, an error message, or a log line. Never offer to run, install, edit, or fix anything. Say "your WhatsApp", never "the bridge" or "the MCP server". Call people by the name in their contacts, never by a number.
+
+Reply in the language they wrote in. If they write Malay or a mix, answer the same way, and draft WhatsApp replies in the language and tone of the chat being replied to.
+
+Keep it short. A summary of unread messages is who, and what they want - not a transcript.
+
+Before sending any WhatsApp message, show the exact words and wait for a yes. Sending is not reversible and it goes to a real person.
+
+If WhatsApp is not working, do not diagnose it yourself. Hand off to whatever setup or repair flow this client provides. The only thing you may ever ask them to do is something on their phone.`
+
 // InitMcpTool initializes MCP tool for the MCP server
 func InitMcpTool() {
+	// OWNER_MODE opts into ownerInstructions for deployments that are a single
+	// non-technical business owner's assistant. Default off, so existing
+	// deployments (n8n, Cursor, etc.) are unaffected by this server option.
+	var serverOpts *mcp.ServerOptions
+	if strings.ToLower(ReadEnv("OWNER_MODE", "false")) == "true" {
+		serverOpts = &mcp.ServerOptions{
+			Instructions: ownerInstructions,
+		}
+	}
+
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "whatsapp-mcp",
 		Version: "v1.0.0",
-	}, nil)
+	}, serverOpts)
 
 	mcp.AddTool[searchContactsInput, any](server, &mcp.Tool{
 		Name:        "search_contacts",
@@ -63,6 +90,11 @@ func InitMcpTool() {
 		Name:        "get_last_interaction",
 		Description: "Get most recent WhatsApp message involving the contact.",
 	}, getLastInteractionHandler)
+
+	mcp.AddTool[markReadInput, any](server, &mcp.Tool{
+		Name:        "mark_read",
+		Description: "Mark a WhatsApp chat as read, clearing its unread badge on the owner's phone too.",
+	}, markReadHandler)
 
 	mcp.AddTool[sendMessageInput, map[string]any](server, &mcp.Tool{
 		Name:        "send_message",
@@ -202,6 +234,11 @@ type listChatsInput struct {
 	Page               int     `json:"page" jsonschema:"default:0"`
 	IncludeLastMessage bool    `json:"include_last_message" jsonschema:"default:true"`
 	SortBy             string  `json:"sort_by" jsonschema:"default:last_active,enum:last_active|name"`
+	UnreadOnly         bool    `json:"unread_only" jsonschema:"default:false,description:Only return chats that have unread messages"`
+}
+
+type markReadInput struct {
+	ChatJID string `json:"chat_jid" jsonschema:"description:The JID of the chat to mark as read"`
 }
 
 type getChatInput struct {
@@ -509,6 +546,9 @@ func listChatsHandler(
 	if in.SortBy != "" {
 		q += "&sort=" + in.SortBy
 	}
+	if in.UnreadOnly {
+		q += "&unread_only=true"
+	}
 
 	data, err := callAPI(http.MethodGet, "/chats"+q, nil)
 	if err != nil {
@@ -544,6 +584,22 @@ func getChatHandler(
 	}
 
 	return OkResult(result["chat"]), nil, nil
+}
+
+func markReadHandler(
+	ctx context.Context,
+	req *mcp.CallToolRequest,
+	in markReadInput,
+) (*mcp.CallToolResult, any, error) {
+	if in.ChatJID == "" {
+		return ErrResult("chat_jid is required"), nil, nil
+	}
+
+	if _, err := callAPI(http.MethodPost, "/mark-read", map[string]any{"chat_jid": in.ChatJID}); err != nil {
+		return ErrResult(err.Error()), nil, nil
+	}
+
+	return OkResult(map[string]any{"ok": true}), nil, nil
 }
 
 func getDirectChatByContactHandler(
