@@ -153,8 +153,7 @@ func InitMcpTool() {
 		Description: "Leave a WhatsApp group this number is a member of.",
 	}, leaveGroupHandler)
 
-	isHttp := strings.ToLower(ReadEnv("IS_HTTP", "false")) == "true" ||
-		strings.ToLower(ReadEnv("IS_HTTP", "0")) == "1"
+	isHttp := servesRemoteClients()
 
 	ctx := context.Background()
 
@@ -819,10 +818,25 @@ func uploadMediaDescription() string {
 	return "Upload a LOCAL file to temporary storage (MinIO) so it can be sent with send_media — this server is REMOTE and cannot read the user's disk. " + tail
 }
 
-// bridgeIsLocal reports whether the bridge this server talks to runs on the same
-// machine. When it does, this process can read the user's disk, so send_media
-// accepts a real local path instead of forcing the caller to inline base64.
+// servesRemoteClients reports whether this server is reached over HTTP rather
+// than stdio. HTTP means the caller is on some other machine.
+func servesRemoteClients() bool {
+	v := strings.ToLower(ReadEnv("IS_HTTP", "false"))
+	return v == "true" || v == "1"
+}
+
+// bridgeIsLocal reports whether this process shares a filesystem with whoever is
+// calling it, which is what decides if send_media can take a path.
+//
+// A localhost bridge is NOT enough on its own. The hosted deployments run the
+// MCP server and its bridge in one container and point API_BASE_URL at
+// 127.0.0.1, yet the caller is a WhatsApp user on their own laptop — offering
+// them a path there would be wrong. Only a stdio server is genuinely on the
+// caller's machine.
 func bridgeIsLocal() bool {
+	if servesRemoteClients() {
+		return false
+	}
 	u, err := url.Parse(apiBaseURL)
 	if err != nil {
 		return false
