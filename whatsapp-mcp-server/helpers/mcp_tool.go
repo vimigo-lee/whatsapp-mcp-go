@@ -11,7 +11,6 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
-	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -688,7 +687,7 @@ func sendMediaHandler(
 		if err != nil {
 			return &mcp.CallToolResult{IsError: true}, map[string]any{"success": false, "error": fmt.Sprintf("invalid path: %v", err)}, nil
 		}
-		if !bridgeIsLocal() {
+		if !callerFilesReadable() {
 			return &mcp.CallToolResult{IsError: true}, map[string]any{"success": false, "error": "this server is remote and cannot read " + absPath + "; upload the file with upload_media and pass the returned url"}, nil
 		}
 		data, rerr := os.ReadFile(absPath)
@@ -802,7 +801,7 @@ func sendMediaHandler(
 // install reads files off disk, a remote one cannot and needs an upload first.
 func sendMediaDescription() string {
 	const base = "Send an image, video or document (with an optional text caption) to a WhatsApp chat. Provide the media as EXACTLY ONE of: "
-	if bridgeIsLocal() {
+	if callerFilesReadable() {
 		return base + "'media_path' (absolute path to a file on THIS machine — PREFERRED for local files such as spreadsheets, PDFs and photos; the server reads the bytes itself, so never base64 a local file into the tool call), 'url' (a public http(s) link the server downloads), or 'base64' (raw media bytes — last resort). Always pass a 'filename' with its real extension (e.g. report.xlsx) so the document arrives with the right type; media_path derives it automatically."
 	}
 	return base + "'url' (a public http(s) link — preferred; the server downloads it), 'base64' (raw media bytes), or 'media_path' (a path to a file ON THE SERVER — rare). This server is REMOTE and CANNOT read the user's local machine, so do NOT pass a local/desktop path as media_path; if the user has a LOCAL file, first call upload_media to upload it and pass the returned 'url' here. Always pass a 'filename' with its real extension (e.g. report.xlsx) so the document arrives with the right type."
@@ -812,7 +811,7 @@ func sendMediaDescription() string {
 // when the server can just read the file, so a local install says so.
 func uploadMediaDescription() string {
 	const tail = "Returns a short-lived 'url' for send_media; auto-deleted after 1 day. DEFAULT: omit 'base64' to get an upload slot {put_url, get_url}, PUT the raw file bytes to put_url (no special headers), then call send_media with url=get_url. Only pass 'base64' (raw bytes, no data: prefix) when explicitly asked — the server then uploads it for you and returns {url}."
-	if bridgeIsLocal() {
+	if callerFilesReadable() {
 		return "Upload a file to temporary storage (MinIO) so it can be sent from elsewhere. NOT needed for local files — this server runs on the user's machine, so pass the path straight to send_media as media_path instead. " + tail
 	}
 	return "Upload a LOCAL file to temporary storage (MinIO) so it can be sent with send_media — this server is REMOTE and cannot read the user's disk. " + tail
@@ -825,28 +824,20 @@ func servesRemoteClients() bool {
 	return v == "true" || v == "1"
 }
 
-// bridgeIsLocal reports whether this process shares a filesystem with whoever is
-// calling it, which is what decides if send_media can take a path.
+// callerFilesReadable reports whether this process shares a filesystem with
+// whoever is calling it, which is what decides if send_media can take a path.
 //
-// A localhost bridge is NOT enough on its own. The hosted deployments run the
-// MCP server and its bridge in one container and point API_BASE_URL at
-// 127.0.0.1, yet the caller is a WhatsApp user on their own laptop — offering
-// them a path there would be wrong. Only a stdio server is genuinely on the
-// caller's machine.
-func bridgeIsLocal() bool {
-	if servesRemoteClients() {
-		return false
-	}
-	u, err := url.Parse(apiBaseURL)
-	if err != nil {
-		return false
-	}
-	switch strings.ToLower(u.Hostname()) {
-	case "localhost", "127.0.0.1", "::1", "":
-		return true
-	default:
-		return false
-	}
+// Transport is the whole signal. A stdio server was spawned by its client and
+// runs on that machine, so the caller's files are simply this process's files.
+// An HTTP server was reached across a network and cannot assume anything about
+// the caller's disk.
+//
+// Where the BRIDGE sits is irrelevant: send_media reads the file here and posts
+// the bytes inline, so a bridge across the LAN is served just as well as one on
+// loopback. Testing the bridge host would deny the path route to a stdio install
+// pointed at a LAN bridge — which is the shipped default.
+func callerFilesReadable() bool {
+	return !servesRemoteClients()
 }
 
 // documentMimeTypes pins the MIME of the document formats people actually send.
