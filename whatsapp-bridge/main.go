@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"math"
 	"math/rand"
+	"mime"
 	"net/http"
 	"os"
 	"os/signal"
@@ -175,6 +176,24 @@ func openDatabase(dbName string) (*sql.DB, error) {
 }
 
 // validateMediaPath sanitize media path
+// documentMimeTypes pins the MIME of the document formats people actually send,
+// keyed by lowercase extension. The Go registry is thin on Office formats and
+// varies by machine, so the common ones are spelled out here.
+var documentMimeTypes = map[string]string{
+	".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+	".xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
+	".xls":  "application/vnd.ms-excel",
+	".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	".doc":  "application/msword",
+	".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+	".ppt":  "application/vnd.ms-powerpoint",
+	".pdf":  "application/pdf",
+	".csv":  "text/csv",
+	".txt":  "text/plain",
+	".json": "application/json",
+	".zip":  "application/zip",
+}
+
 func validateMediaPath(mediaPath string) (string, error) {
 	if mediaPath == "" {
 		return "", fmt.Errorf("empty media path")
@@ -1310,7 +1329,16 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 
 		default:
 			mediaType = whatsmeow.MediaDocument
-			mimeType = "application/octet-stream"
+			// octet-stream makes WhatsApp render every attachment with the same
+			// generic document preview — an .xlsx then looks like a PDF and the
+			// receiving phone won't hand it to Excel. Name the real type.
+			if mt, ok := documentMimeTypes["."+fileExt]; ok {
+				mimeType = mt
+			} else if mt := mime.TypeByExtension("." + fileExt); mt != "" {
+				mimeType = strings.TrimSpace(strings.Split(mt, ";")[0])
+			} else {
+				mimeType = "application/octet-stream"
+			}
 		}
 
 		// Manager-provided MIME beats the extension guess — critical for
@@ -1378,9 +1406,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 				FileLength:    &resp.FileLength,
 			}
 		case whatsmeow.MediaDocument:
-			docName := mediaPath[strings.LastIndex(mediaPath, "/")+1:]
+			// filepath.Base handles Windows separators too; slicing on "/" left
+			// the whole path as the document name for callers on Windows.
+			docName := filepath.Base(mediaPath)
 			if mediaFilename != "" {
-				docName = mediaFilename
+				docName = filepath.Base(mediaFilename)
 			}
 			msg.DocumentMessage = &waE2E.DocumentMessage{
 				Title:         proto.String(docName),
