@@ -9,7 +9,10 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"mime"
 	"net/http"
+	"net/url"
+	"os"
 	"path"
 	"path/filepath"
 	"strings"
@@ -71,12 +74,12 @@ func InitMcpTool() {
 
 	mcp.AddTool[sendMediaInput, map[string]any](server, &mcp.Tool{
 		Name:        "send_media",
-		Description: "Send an image, video or document (with an optional text caption) to a WhatsApp chat. Provide the media as EXACTLY ONE of: 'url' (a public http(s) link — preferred; the server downloads it), 'base64' (raw media bytes), or 'media_path' (a path to a file ON THE SERVER — rare). This server is REMOTE and CANNOT read the user's local machine, so do NOT pass a local/desktop path as media_path; if the user has a LOCAL file, first call upload_media to upload it and pass the returned 'url' here.",
+		Description: sendMediaDescription(),
 	}, sendMediaHandler)
 
 	mcp.AddTool[uploadMediaInput, map[string]any](server, &mcp.Tool{
 		Name:        "upload_media",
-		Description: "Upload a LOCAL file to temporary storage (MinIO) so it can be sent with send_media — this server is REMOTE and cannot read the user's disk. Returns a short-lived 'url' for send_media; auto-deleted after 1 day. DEFAULT: omit 'base64' to get an upload slot {put_url, get_url}, PUT the raw file bytes to put_url (no special headers), then call send_media with url=get_url. Only pass 'base64' (raw bytes, no data: prefix) when explicitly asked — the server then uploads it for you and returns {url}.",
+		Description: uploadMediaDescription(),
 	}, uploadMediaHandler)
 
 	mcp.AddTool[sendAudioMessageInput, map[string]any](server, &mcp.Tool{
@@ -232,7 +235,7 @@ type sendMediaInput struct {
 	Recipient string  `json:"recipient" jsonschema:"description:Phone number (no +) or group JID like 123@g.us"`
 	URL       *string `json:"url,omitempty" jsonschema:"description:Public http(s) URL of the media; the server downloads it. Provide exactly one of url/base64/media_path."`
 	Base64    *string `json:"base64,omitempty" jsonschema:"description:Raw base64 of the media bytes (no data: prefix). Provide exactly one of url/base64/media_path."`
-	MediaPath *string `json:"media_path,omitempty" jsonschema:"description:Absolute path to a file ON THE SERVER (not the user's local machine) — rare. Provide exactly one of url/base64/media_path."`
+	MediaPath *string `json:"media_path,omitempty" jsonschema:"description:Absolute path to a file the server can read. On a local install this is the machine you are running on — use it for any local file instead of base64. On a remote install it cannot work; upload the file first. Provide exactly one of url/base64/media_path."`
 	Filename  *string `json:"filename,omitempty" jsonschema:"description:Filename with extension (e.g. photo.jpg); drives the media type. Optional when url already ends in a filename."`
 	Caption   *string `json:"caption,omitempty" jsonschema:"description:Optional text caption sent with the media"`
 }
@@ -671,26 +674,53 @@ func sendMediaHandler(
 		return &mcp.CallToolResult{IsError: true}, map[string]any{"success": false, "error": "provide exactly one of url, base64 or media_path"}, nil
 	}
 
-	var b64, filename string
+	var b64, filename, ctMime string
 	if in.Filename != nil {
 		filename = strings.TrimSpace(*in.Filename)
 	}
 
-	// Server-local path: forward as-is; the bridge reads + validates it. Caption
-	// rides along as the message.
+	// A path only works when this process can see the file. Against a local
+	// bridge we read the bytes here and hand them over inline, so the caller
+	// never has to carry a base64 blob just to send a file that is already on
+	// disk. The bridge's own media_path route only accepts paths relative to its
+	// ./media directory, so forwarding an absolute path there always fails.
 	if hasPath {
 		absPath, err := filepath.Abs(strings.TrimSpace(*in.MediaPath))
 		if err != nil {
 			return &mcp.CallToolResult{IsError: true}, map[string]any{"success": false, "error": fmt.Sprintf("invalid path: %v", err)}, nil
 		}
-		payload := map[string]any{"recipient": in.Recipient, "media_path": absPath, "no_delay": true}
+		if !bridgeIsLocal() {
+			return &mcp.CallToolResult{IsError: true}, map[string]any{"success": false, "error": "this server is remote and cannot read " + absPath + "; upload the file with upload_media and pass the returned url"}, nil
+		}
+		data, rerr := os.ReadFile(absPath)
+		if rerr != nil {
+			return &mcp.CallToolResult{IsError: true}, map[string]any{"success": false, "error": fmt.Sprintf("failed to read file: %v", rerr)}, nil
+		}
+		if len(data) == 0 {
+			return &mcp.CallToolResult{IsError: true}, map[string]any{"success": false, "error": "file is empty"}, nil
+		}
+		if len(data) > maxMediaBytes {
+			return &mcp.CallToolResult{IsError: true}, map[string]any{"success": false, "error": "media exceeds size cap"}, nil
+		}
+		if filename == "" {
+			filename = filepath.Base(absPath)
+		}
+		payload := map[string]any{
+			"recipient":      in.Recipient,
+			"media_base64":   base64.StdEncoding.EncodeToString(data),
+			"media_filename": filename,
+			"no_delay":       true,
+		}
+		if mt := mimeForFilename(filename); mt != "" {
+			payload["media_mimetype"] = mt
+		}
 		if in.Caption != nil && *in.Caption != "" {
 			payload["message"] = *in.Caption
 		}
 		if _, err := callAPI(http.MethodPost, "/send", payload); err != nil {
 			return &mcp.CallToolResult{IsError: true}, map[string]any{"success": false, "error": err.Error()}, nil
 		}
-		return &mcp.CallToolResult{}, map[string]any{"success": true, "media_path": absPath}, nil
+		return &mcp.CallToolResult{}, map[string]any{"success": true, "media_path": absPath, "filename": filename}, nil
 	}
 
 	if hasURL {
@@ -719,6 +749,7 @@ func sendMediaHandler(
 			return &mcp.CallToolResult{IsError: true}, map[string]any{"success": false, "error": "media exceeds size cap"}, nil
 		}
 		b64 = base64.StdEncoding.EncodeToString(data)
+		ctMime = strings.TrimSpace(strings.Split(resp.Header.Get("Content-Type"), ";")[0])
 		// Derive a filename (the bridge sniffs media type by extension) from the
 		// URL path, then the content-type, falling back to a generic name.
 		if filename == "" {
@@ -750,6 +781,14 @@ func sendMediaHandler(
 		"media_filename": filename,
 		"no_delay":       true,
 	}
+	// Documents need a real MIME or WhatsApp shows a generic preview and the
+	// file won't open in its native app. The extension wins; a served
+	// Content-Type only fills the gap for extensions we don't recognise.
+	if mt := mimeForFilename(filename); mt != "" {
+		payload["media_mimetype"] = mt
+	} else if ctMime != "" && ctMime != "application/octet-stream" {
+		payload["media_mimetype"] = ctMime
+	}
 	if in.Caption != nil && *in.Caption != "" {
 		payload["message"] = *in.Caption
 	}
@@ -758,6 +797,78 @@ func sendMediaHandler(
 		return &mcp.CallToolResult{IsError: true}, map[string]any{"success": false, "error": err.Error()}, nil
 	}
 	return &mcp.CallToolResult{}, map[string]any{"success": true, "filename": filename}, nil
+}
+
+// sendMediaDescription tailors send_media's guidance to the deployment: a local
+// install reads files off disk, a remote one cannot and needs an upload first.
+func sendMediaDescription() string {
+	const base = "Send an image, video or document (with an optional text caption) to a WhatsApp chat. Provide the media as EXACTLY ONE of: "
+	if bridgeIsLocal() {
+		return base + "'media_path' (absolute path to a file on THIS machine — PREFERRED for local files such as spreadsheets, PDFs and photos; the server reads the bytes itself, so never base64 a local file into the tool call), 'url' (a public http(s) link the server downloads), or 'base64' (raw media bytes — last resort). Always pass a 'filename' with its real extension (e.g. report.xlsx) so the document arrives with the right type; media_path derives it automatically."
+	}
+	return base + "'url' (a public http(s) link — preferred; the server downloads it), 'base64' (raw media bytes), or 'media_path' (a path to a file ON THE SERVER — rare). This server is REMOTE and CANNOT read the user's local machine, so do NOT pass a local/desktop path as media_path; if the user has a LOCAL file, first call upload_media to upload it and pass the returned 'url' here. Always pass a 'filename' with its real extension (e.g. report.xlsx) so the document arrives with the right type."
+}
+
+// uploadMediaDescription mirrors sendMediaDescription: uploading is pointless
+// when the server can just read the file, so a local install says so.
+func uploadMediaDescription() string {
+	const tail = "Returns a short-lived 'url' for send_media; auto-deleted after 1 day. DEFAULT: omit 'base64' to get an upload slot {put_url, get_url}, PUT the raw file bytes to put_url (no special headers), then call send_media with url=get_url. Only pass 'base64' (raw bytes, no data: prefix) when explicitly asked — the server then uploads it for you and returns {url}."
+	if bridgeIsLocal() {
+		return "Upload a file to temporary storage (MinIO) so it can be sent from elsewhere. NOT needed for local files — this server runs on the user's machine, so pass the path straight to send_media as media_path instead. " + tail
+	}
+	return "Upload a LOCAL file to temporary storage (MinIO) so it can be sent with send_media — this server is REMOTE and cannot read the user's disk. " + tail
+}
+
+// bridgeIsLocal reports whether the bridge this server talks to runs on the same
+// machine. When it does, this process can read the user's disk, so send_media
+// accepts a real local path instead of forcing the caller to inline base64.
+func bridgeIsLocal() bool {
+	u, err := url.Parse(apiBaseURL)
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(u.Hostname()) {
+	case "localhost", "127.0.0.1", "::1", "":
+		return true
+	default:
+		return false
+	}
+}
+
+// documentMimeTypes pins the MIME of the document formats people actually send.
+// Without an explicit type the bridge falls back to application/octet-stream,
+// and WhatsApp then renders the attachment with a generic document preview —
+// an .xlsx shows up looking like a PDF and won't open in Excel.
+var documentMimeTypes = map[string]string{
+	".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+	".xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
+	".xls":  "application/vnd.ms-excel",
+	".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	".doc":  "application/msword",
+	".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+	".ppt":  "application/vnd.ms-powerpoint",
+	".pdf":  "application/pdf",
+	".csv":  "text/csv",
+	".txt":  "text/plain",
+	".json": "application/json",
+	".zip":  "application/zip",
+}
+
+// mimeForFilename resolves a filename to a MIME type, preferring the pinned
+// document table and falling back to the platform registry. Returns "" when the
+// extension is unknown, letting the bridge keep its own extension guess.
+func mimeForFilename(filename string) string {
+	ext := strings.ToLower(filepath.Ext(strings.TrimSpace(filename)))
+	if ext == "" {
+		return ""
+	}
+	if mt, ok := documentMimeTypes[ext]; ok {
+		return mt
+	}
+	if mt := mime.TypeByExtension(ext); mt != "" {
+		return mt
+	}
+	return ""
 }
 
 func extFromContentType(ct string) string {
