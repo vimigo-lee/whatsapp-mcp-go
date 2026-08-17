@@ -95,7 +95,7 @@ If you're running this project on Windows, be aware that `go-sqlite3` requires *
    We recommend using [MSYS2](https://www.msys2.org/) to install a C compiler for Windows. After installing MSYS2, make sure to add the `ucrt64\bin` folder to your `PATH`.  
    → A step-by-step guide is available [here](https://code.visualstudio.com/docs/cpp/config-mingw).
 
-   > **PATH order matters.** `C:\msys64\ucrt64\bin` must come **before** any other directory that ships MinGW DLLs — e.g. Laragon (`C:\laragon\bin\git\mingw64\bin`, its Apache `bin`) or Git for Windows. If an older `libgmp-10.dll`, `libzstd.dll`, `zlib1.dll`, or `libwinpthread-1.dll` shadows the MSYS2 copies, gcc's internal `cc1.exe` dies with `STATUS_ENTRYPOINT_NOT_FOUND` (0xC0000139) and the only symptom is a **silent** `cgo.exe: exit status 2` with no error message. Quick fix for one build without touching the system PATH:
+   > **PATH order matters.** Many Windows dev tools bundle their own (often older) MinGW runtime DLLs — Git for Windows, Laragon, XAMPP, Strawberry Perl, etc. If any of them appear in `PATH` before `C:\msys64\ucrt64\bin`, their stale `libgmp-10.dll` / `libzstd.dll` / `zlib1.dll` / `libwinpthread-1.dll` shadow the MSYS2 copies and gcc's internal `cc1.exe` crashes with `STATUS_ENTRYPOINT_NOT_FOUND` (0xC0000139). The only symptom is a **silent** `cgo.exe: exit status 2` with no compiler error text. If you hit that, put MSYS2 first for the build:
    >
    > ```powershell
    > $env:PATH = "C:\msys64\ucrt64\bin;$env:PATH"
