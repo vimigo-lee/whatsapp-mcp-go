@@ -2640,17 +2640,19 @@ func handleMediaRetryResponse(client *whatsmeow.Client, messageStore *MessageSto
 func extractDirectPathFromURL(url string) string {
 	// The direct path is typically in the URL, we need to extract it
 	// Example URL: https://mmg.whatsapp.net/v/t62.7118-24/13812002_698058036224062_3424455886509161511_n.enc?ccb=11-4&oh=...
+	//
+	// The query string MUST be kept: it carries the CDN auth tokens (oh=, oe=),
+	// and whatsmeow's downloadMediaWithPath appends its own params with "&",
+	// assuming the direct path still contains its "?" — a stripped path yields
+	// ".../x.enc&hash=..." which the CDN answers with 403, previously
+	// misdiagnosed here as expired media.
 
 	parts := strings.SplitN(url, ".net/", 2)
 	if len(parts) < 2 {
 		return url // Return original URL if parsing fails
 	}
 
-	pathPart := parts[1]
-
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	return "/" + pathPart
+	return "/" + parts[1]
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
