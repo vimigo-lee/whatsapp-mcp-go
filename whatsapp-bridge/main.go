@@ -3715,11 +3715,24 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		// Cross-check the cached event flags against the live client. The flags
+		// are driven by the event stream, and that stream can deliver a stale
+		// Connected AFTER a LoggedOut — the socket that was mid-reconnect when
+		// the device got removed finishes connecting a few ms later. That used
+		// to leave this endpoint reporting connected+logged_in forever on a
+		// bridge with no session and a dead socket. Store.ID is the
+		// authoritative "has a session" bit (whatsmeow clears it when it deletes
+		// the device) and IsConnected() the authoritative socket bit.
+		jid := ""
+		if client.Store.ID != nil {
+			jid = client.Store.ID.String()
+		}
 		respondJSON(w, http.StatusOK, map[string]any{
-			"connected":        state.Connected(),
-			"logged_in":        state.LoggedIn(),
+			"connected":        state.Connected() && client.IsConnected(),
+			"logged_in":        state.LoggedIn() && client.Store.ID != nil,
 			"pairing_required": state.PairingRequired(),
 			"wa_version":       state.WAVersion(),
+			"jid":              jid,
 		})
 	})
 
@@ -5455,7 +5468,13 @@ func main() {
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
 			state.SetConnected(true)
-			state.SetLoggedIn(true)
+			// Only a real session counts as logged in. A Connected event can
+			// arrive after LoggedOut has already deleted the device (the
+			// in-flight reconnect completes a few ms later), and blindly setting
+			// true there pinned the bridge to connected+logged_in with no
+			// session: the manager never flipped the number to logged_out and
+			// every send failed with "Not connected to WhatsApp".
+			state.SetLoggedIn(client.Store.ID != nil)
 			state.ClearPairingQR()
 			outdatedRetriesMu.Lock()
 			outdatedRetries = 0
