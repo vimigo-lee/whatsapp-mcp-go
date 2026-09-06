@@ -2061,10 +2061,12 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
 
-	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
-	if err != nil {
-		logger.Warnf("Failed to store chat: %v", err)
-	}
+	// NOTE: the chat row's last_message_time is bumped only once a message row
+	// is actually about to be stored (see below). Bumping it up front let every
+	// content-less event — reactions, edits/revokes, undecryptable secrets,
+	// empty protocol messages — advance the chat's "last activity" with no
+	// message behind it, so the manager's chat list showed a newer date than
+	// the newest bubble in the conversation.
 
 	// MSG-DEBUG (temporary): dump every message's raw protobuf + info to diagnose
 	// how edits are delivered. Remove after diagnosis.
@@ -2166,7 +2168,13 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// can show a "Forwarded" label above the message.
 	isForwarded := contextInfoOf(unwrapMessage(msg.Message)).GetIsForwarded()
 
-	err = messageStore.StoreMessage(
+	// The chat row is upserted with the same timestamp the message row gets, so
+	// chats.last_message_time can never run ahead of the newest stored message.
+	if err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp); err != nil {
+		logger.Warnf("Failed to store chat: %v", err)
+	}
+
+	err := messageStore.StoreMessage(
 		msg.Info.ID,
 		chatJID,
 		sender,
@@ -4124,29 +4132,12 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 
 		messages := conversation.Messages
 		if len(messages) > 0 {
-			latestMsg := messages[0]
-			if latestMsg == nil || latestMsg.Message == nil {
-				continue
-			}
-
-			timestamp := time.Time{}
-			if ts := latestMsg.Message.GetMessageTimestamp(); ts != 0 {
-				timestamp = time.Unix(int64(ts), 0)
-			} else {
-				continue
-			}
-
-			messageStore.StoreChat(chatJID, name, timestamp)
-			// Seed the unread badge from WhatsApp's own per-chat count so the
-			// manager shows true unread state right after a (re)sync. A chat the
-			// user explicitly marked unread reports count 0 but MarkedAsUnread.
-			unreadSeed := int(conversation.GetUnreadCount())
-			if unreadSeed == 0 && conversation.GetMarkedAsUnread() {
-				unreadSeed = 1
-			}
-			if err := messageStore.SetUnreadCount(chatJID, unreadSeed); err != nil {
-				logger.Warnf("Failed to set unread count: %v", err)
-			}
+			// Newest timestamp among the messages this loop actually stores. The
+			// chat row is bumped from that — not from conversation.Messages[0] —
+			// because the newest history entry is often content-less (protocol
+			// or undecryptable) and skipped below, which used to leave the chat
+			// stamped later than any message the manager can show.
+			var newestStored time.Time
 
 			for _, msg := range messages {
 				if msg == nil || msg.Message == nil {
@@ -4249,6 +4240,9 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					logger.Warnf("Failed to store history message: %v", err)
 				} else {
 					syncedCount++
+					if timestamp.After(newestStored) {
+						newestStored = timestamp
+					}
 					if mediaType != "" {
 						logger.Infof("Stored message: [%s] %s -> %s: [%s: %s] %s",
 							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, mediaType, filename, content)
@@ -4257,6 +4251,24 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, content)
 					}
 				}
+			}
+
+			if newestStored.IsZero() {
+				// Nothing storable in this conversation — no chat row to bump.
+				continue
+			}
+			if err := messageStore.StoreChat(chatJID, name, newestStored); err != nil {
+				logger.Warnf("Failed to store chat: %v", err)
+			}
+			// Seed the unread badge from WhatsApp's own per-chat count so the
+			// manager shows true unread state right after a (re)sync. A chat the
+			// user explicitly marked unread reports count 0 but MarkedAsUnread.
+			unreadSeed := int(conversation.GetUnreadCount())
+			if unreadSeed == 0 && conversation.GetMarkedAsUnread() {
+				unreadSeed = 1
+			}
+			if err := messageStore.SetUnreadCount(chatJID, unreadSeed); err != nil {
+				logger.Warnf("Failed to set unread count: %v", err)
 			}
 		}
 	}
