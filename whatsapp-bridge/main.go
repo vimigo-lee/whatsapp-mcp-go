@@ -2073,6 +2073,16 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	chatJID := normalizeUserJID(client, msg.Info.Chat).String()
 	sender := normalizeUserJID(client, msg.Info.Sender).User
 
+	// A live event with no timestamp is a re-delivery WhatsApp could not date
+	// (seen for old own messages replayed at reconnect). Storing it would stamp
+	// it with the arrival time and float it to the top of the chat, and the
+	// upsert would overwrite a correct timestamp if the row already exists —
+	// history sync skips these too, so do the same here.
+	if msg.Info.Timestamp.IsZero() {
+		logger.Warnf("Skipping message %s in %s: no timestamp", msg.Info.ID, chatJID)
+		return
+	}
+
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
 
 	// NOTE: the chat row's last_message_time is bumped only once a message row
@@ -4182,6 +4192,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 
 	onDemand := historySync.Data.GetSyncType() == waHistorySync.HistorySync_ON_DEMAND
 	syncedCount := 0
+	undated := 0
 	for _, conversation := range historySync.Data.Conversations {
 		if conversation.ID == nil {
 			continue
@@ -4200,6 +4211,12 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 		name := GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
 
 		messages := conversation.Messages
+		if onDemand && len(messages) == 0 {
+			// The phone answered a backfill page with an empty conversation:
+			// nothing older exists. Wake the walk so it can finish as exhausted
+			// instead of waiting out its timeout.
+			notifyBackfill(chatJID, backfillPage{})
+		}
 		if len(messages) > 0 {
 			// Newest timestamp among the messages this loop actually stores. The
 			// chat row is bumped from that — not from conversation.Messages[0] —
@@ -4284,6 +4301,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				if ts := msg.Message.GetMessageTimestamp(); ts != 0 {
 					timestamp = time.Unix(int64(ts), 0)
 				} else {
+					undated++
 					continue
 				}
 
@@ -4358,7 +4376,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 		}
 	}
 
-	slog.Info("history sync complete", "stored_messages", syncedCount)
+	slog.Info("history sync complete", "stored_messages", syncedCount, "undated_skipped", undated)
 }
 
 // ---- Per-chat history backfill -------------------------------------------
@@ -4394,6 +4412,7 @@ const (
 	backfillPageSize    = 100
 	backfillMaxPages    = 200
 	backfillPageTimeout = 90 * time.Second
+	backfillProbeTimeout = 25 * time.Second
 	backfillPageGap     = 1500 * time.Millisecond
 )
 
@@ -4478,6 +4497,17 @@ func runBackfill(client *whatsmeow.Client, messageStore *MessageStore, chatJID s
 		return
 	}
 
+	// The phone looks the chat up by the JID in the request. Since the LID
+	// migration many 1:1 chats live on the phone under their LID, and a request
+	// naming the phone-number JID gets no answer at all — so try both, and keep
+	// using whichever one the phone answered.
+	addresses := []types.JID{jid}
+	if jid.Server == types.DefaultUserServer {
+		if lid, err := client.Store.LIDs.GetLIDForPN(context.Background(), jid); err == nil && !lid.IsEmpty() {
+			addresses = append(addresses, lid)
+		}
+	}
+
 	var prevAnchor string
 	for page := 1; page <= maxPages; page++ {
 		if client.Store.ID == nil || !client.IsConnected() {
@@ -4501,37 +4531,57 @@ func runBackfill(client *whatsmeow.Client, messageStore *MessageStore, chatJID s
 		}
 		prevAnchor = id
 
-		lastKnown := &types.MessageInfo{
-			MessageSource: types.MessageSource{Chat: jid, IsFromMe: isFromMe},
-			ID:            id,
-			Timestamp:     ts,
-		}
-		historyMsg := client.BuildHistorySyncRequest(lastKnown, backfillPageSize)
-		if historyMsg == nil {
-			finish("error", "failed to build history request")
-			return
-		}
-		if _, err := client.SendPeerMessage(context.Background(), historyMsg); err != nil {
-			finish("error", "history request failed: "+err.Error())
-			return
-		}
-		slog.Info("backfill page requested", "chat_jid", chatJID, "page", page, "anchor", id, "anchor_ts", ts.Format(time.RFC3339))
-
-		select {
-		case got := <-ch:
-			setBackfillStatus(chatJID, func(st *BackfillStatus) {
-				st.Pages = page
-				st.Stored += got.stored
-				if !got.oldest.IsZero() {
-					st.Oldest = got.oldest.UTC().Format(time.RFC3339)
-				}
-			})
-			if got.stored == 0 {
-				finish("exhausted", "")
+		var got backfillPage
+		answered := false
+		for ai, addr := range addresses {
+			lastKnown := &types.MessageInfo{
+				MessageSource: types.MessageSource{Chat: addr, IsFromMe: isFromMe},
+				ID:            id,
+				Timestamp:     ts,
+			}
+			historyMsg := client.BuildHistorySyncRequest(lastKnown, backfillPageSize)
+			if historyMsg == nil {
+				finish("error", "failed to build history request")
 				return
 			}
-		case <-time.After(backfillPageTimeout):
+			if _, err := client.SendPeerMessage(context.Background(), historyMsg); err != nil {
+				finish("error", "history request failed: "+err.Error())
+				return
+			}
+			slog.Info("backfill page requested", "chat_jid", chatJID, "as", addr.String(), "page", page, "anchor", id, "anchor_ts", ts.Format(time.RFC3339))
+
+			// A phone that knows the chat answers within a few seconds; give
+			// an alternate address a shorter probe when there is one left to try.
+			wait := backfillPageTimeout
+			if ai < len(addresses)-1 {
+				wait = backfillProbeTimeout
+			}
+			select {
+			case got = <-ch:
+				answered = true
+			case <-time.After(wait):
+			}
+			if answered {
+				if ai > 0 {
+					// Promote the address that worked so later pages skip the probe.
+					addresses = append([]types.JID{addr}, addresses[:ai]...)
+				}
+				break
+			}
+		}
+		if !answered {
 			finish("timeout", "the phone did not answer the history request (it may be offline)")
+			return
+		}
+		setBackfillStatus(chatJID, func(st *BackfillStatus) {
+			st.Pages = page
+			st.Stored += got.stored
+			if !got.oldest.IsZero() {
+				st.Oldest = got.oldest.UTC().Format(time.RFC3339)
+			}
+		})
+		if got.stored == 0 {
+			finish("exhausted", "")
 			return
 		}
 		time.Sleep(backfillPageGap)
