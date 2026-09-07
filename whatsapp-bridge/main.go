@@ -897,6 +897,20 @@ func (store *MessageStore) LatestAnywhere() (id, chatJID string, isFromMe bool, 
 	return id, chatJID, isFromMe, ts, id != ""
 }
 
+// OldestMessage returns the earliest stored message in one chat — the anchor a
+// per-chat backfill hands to BuildHistorySyncRequest so the phone sends the
+// page that precedes what we already hold.
+func (store *MessageStore) OldestMessage(chatJID string) (id string, isFromMe bool, ts time.Time, ok bool) {
+	q := "SELECT id, is_from_me, timestamp FROM messages WHERE chat_jid = ? ORDER BY timestamp ASC LIMIT 1"
+	if isPostgres {
+		q = "SELECT id, is_from_me, timestamp FROM messages WHERE chat_jid = $1 ORDER BY timestamp ASC LIMIT 1"
+	}
+	if err := store.db.QueryRow(q, chatJID).Scan(&id, &isFromMe, &ts); err != nil {
+		return "", false, time.Time{}, false
+	}
+	return id, isFromMe, ts, id != ""
+}
+
 // StoreMessage Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
 	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64,
@@ -3037,6 +3051,60 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 		respondJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	})
 
+	// Per-chat history backfill — walks WhatsApp's on-demand history backwards
+	// for one chat without re-pairing. POST starts it, GET reports progress.
+	apiMux.HandleFunc("/backfill", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			chatJID := r.URL.Query().Get("chat_jid")
+			if chatJID == "" {
+				respondError(w, http.StatusBadRequest, "chat_jid required")
+				return
+			}
+			st, ok := getBackfillStatus(chatJID)
+			if !ok {
+				respondJSON(w, http.StatusOK, map[string]interface{}{"chat_jid": chatJID, "running": false})
+				return
+			}
+			respondJSON(w, http.StatusOK, st)
+		case http.MethodPost:
+			var body struct {
+				ChatJID  string `json:"chat_jid"`
+				Until    string `json:"until"`     // RFC3339; stop once the oldest stored message is at or before this
+				MaxPages int    `json:"max_pages"` // optional cap, defaults to backfillMaxPages
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ChatJID == "" {
+				respondError(w, http.StatusBadRequest, "chat_jid required")
+				return
+			}
+			chat, err := types.ParseJID(body.ChatJID)
+			if err != nil {
+				respondError(w, http.StatusBadRequest, "invalid chat_jid")
+				return
+			}
+			until := time.Time{}
+			if body.Until != "" {
+				if until, err = time.Parse(time.RFC3339, body.Until); err != nil {
+					respondError(w, http.StatusBadRequest, "until must be RFC3339")
+					return
+				}
+			}
+			if client.Store.ID == nil || !client.IsConnected() {
+				respondError(w, http.StatusConflict, "not connected")
+				return
+			}
+			chatJID := normalizeUserJID(client, chat).String()
+			if !startBackfill(client, messageStore, chatJID, until, body.MaxPages) {
+				respondError(w, http.StatusConflict, "backfill already running for this chat")
+				return
+			}
+			st, _ := getBackfillStatus(chatJID)
+			respondJSON(w, http.StatusAccepted, st)
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
 	// Mark a chat as read — sends a real read receipt to WhatsApp (clearing the
 	// unread state on the owner's phone, like opening the chat there would) and
 	// zeroes the local unread badge so the manager's board reflects it at once.
@@ -4110,8 +4178,9 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 // Handle history sync events
 func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
-	slog.Info("received history sync event", "conversations", len(historySync.Data.Conversations))
+	slog.Info("received history sync event", "conversations", len(historySync.Data.Conversations), "type", historySync.Data.GetSyncType().String())
 
+	onDemand := historySync.Data.GetSyncType() == waHistorySync.HistorySync_ON_DEMAND
 	syncedCount := 0
 	for _, conversation := range historySync.Data.Conversations {
 		if conversation.ID == nil {
@@ -4138,6 +4207,10 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			// or undecryptable) and skipped below, which used to leave the chat
 			// stamped later than any message the manager can show.
 			var newestStored time.Time
+			// Per-conversation tally handed to a waiting backfill so it can
+			// decide whether to page further back.
+			var oldestStored time.Time
+			convStored := 0
 
 			for _, msg := range messages {
 				if msg == nil || msg.Message == nil {
@@ -4240,8 +4313,12 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					logger.Warnf("Failed to store history message: %v", err)
 				} else {
 					syncedCount++
+					convStored++
 					if timestamp.After(newestStored) {
 						newestStored = timestamp
+					}
+					if oldestStored.IsZero() || timestamp.Before(oldestStored) {
+						oldestStored = timestamp
 					}
 					if mediaType != "" {
 						logger.Infof("Stored message: [%s] %s -> %s: [%s: %s] %s",
@@ -4253,12 +4330,20 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				}
 			}
 
+			if onDemand {
+				notifyBackfill(chatJID, backfillPage{stored: convStored, oldest: oldestStored})
+			}
 			if newestStored.IsZero() {
 				// Nothing storable in this conversation — no chat row to bump.
 				continue
 			}
 			if err := messageStore.StoreChat(chatJID, name, newestStored); err != nil {
 				logger.Warnf("Failed to store chat: %v", err)
+			}
+			if onDemand {
+				// An on-demand page is older history, not the phone's current
+				// unread state — re-seeding here would wipe a live badge.
+				continue
 			}
 			// Seed the unread badge from WhatsApp's own per-chat count so the
 			// manager shows true unread state right after a (re)sync. A chat the
@@ -4274,6 +4359,184 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 	}
 
 	slog.Info("history sync complete", "stored_messages", syncedCount)
+}
+
+// ---- Per-chat history backfill -------------------------------------------
+//
+// WhatsApp's on-demand history request is scoped to one chat and anchored on a
+// message we already hold: the phone answers with the page that precedes it.
+// A backfill walks that backwards — anchor on the oldest stored message, ask,
+// wait for the HistorySync page to land, repeat — until it reaches the
+// requested date, the phone has nothing older, or the page budget runs out.
+// The store's upsert means a re-sent message overwrites what we hold, which is
+// also how a row stored with a wrong timestamp gets its real one back.
+
+type backfillPage struct {
+	stored int
+	oldest time.Time
+}
+
+// BackfillStatus is the JSON shape reported to the manager.
+type BackfillStatus struct {
+	ChatJID   string `json:"chat_jid"`
+	Running   bool   `json:"running"`
+	Pages     int    `json:"pages"`
+	Stored    int    `json:"stored"`
+	Oldest    string `json:"oldest,omitempty"`
+	Until     string `json:"until,omitempty"`
+	Outcome   string `json:"outcome,omitempty"` // reached | exhausted | budget | timeout | error
+	Error     string `json:"error,omitempty"`
+	StartedAt string `json:"started_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+const (
+	backfillPageSize    = 100
+	backfillMaxPages    = 200
+	backfillPageTimeout = 90 * time.Second
+	backfillPageGap     = 1500 * time.Millisecond
+)
+
+var (
+	backfillWaiters  sync.Map // chatJID -> chan backfillPage
+	backfillStatuses sync.Map // chatJID -> *BackfillStatus
+	backfillMu       sync.Mutex
+)
+
+func notifyBackfill(chatJID string, page backfillPage) {
+	if ch, ok := backfillWaiters.Load(chatJID); ok {
+		select {
+		case ch.(chan backfillPage) <- page:
+		default:
+		}
+	}
+}
+
+func setBackfillStatus(chatJID string, mutate func(st *BackfillStatus)) *BackfillStatus {
+	backfillMu.Lock()
+	defer backfillMu.Unlock()
+	now := time.Now().UTC().Format(time.RFC3339)
+	v, _ := backfillStatuses.LoadOrStore(chatJID, &BackfillStatus{ChatJID: chatJID, StartedAt: now})
+	st := v.(*BackfillStatus)
+	mutate(st)
+	st.UpdatedAt = now
+	cp := *st
+	return &cp
+}
+
+func getBackfillStatus(chatJID string) (*BackfillStatus, bool) {
+	backfillMu.Lock()
+	defer backfillMu.Unlock()
+	v, ok := backfillStatuses.Load(chatJID)
+	if !ok {
+		return nil, false
+	}
+	cp := *v.(*BackfillStatus)
+	return &cp, true
+}
+
+// startBackfill kicks the walk for one chat. Returns false when one is already
+// running for that chat.
+func startBackfill(client *whatsmeow.Client, messageStore *MessageStore, chatJID string, until time.Time, maxPages int) bool {
+	if st, ok := getBackfillStatus(chatJID); ok && st.Running {
+		return false
+	}
+	if maxPages <= 0 || maxPages > backfillMaxPages {
+		maxPages = backfillMaxPages
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	backfillMu.Lock()
+	backfillStatuses.Store(chatJID, &BackfillStatus{
+		ChatJID:   chatJID,
+		Running:   true,
+		Until:     until.UTC().Format(time.RFC3339),
+		StartedAt: now,
+		UpdatedAt: now,
+	})
+	backfillMu.Unlock()
+	go runBackfill(client, messageStore, chatJID, until, maxPages)
+	return true
+}
+
+func runBackfill(client *whatsmeow.Client, messageStore *MessageStore, chatJID string, until time.Time, maxPages int) {
+	finish := func(outcome, errMsg string) {
+		setBackfillStatus(chatJID, func(st *BackfillStatus) {
+			st.Running = false
+			st.Outcome = outcome
+			st.Error = errMsg
+		})
+		slog.Info("backfill finished", "chat_jid", chatJID, "outcome", outcome, "error", errMsg)
+	}
+
+	ch := make(chan backfillPage, 1)
+	backfillWaiters.Store(chatJID, ch)
+	defer backfillWaiters.Delete(chatJID)
+
+	jid, err := types.ParseJID(chatJID)
+	if err != nil {
+		finish("error", "invalid chat jid")
+		return
+	}
+
+	var prevAnchor string
+	for page := 1; page <= maxPages; page++ {
+		if client.Store.ID == nil || !client.IsConnected() {
+			finish("error", "not connected")
+			return
+		}
+		id, isFromMe, ts, ok := messageStore.OldestMessage(chatJID)
+		if !ok {
+			finish("error", "no stored message to anchor on")
+			return
+		}
+		if id == prevAnchor {
+			// The last page moved nothing older into the store: the phone has
+			// no earlier history for this chat.
+			finish("exhausted", "")
+			return
+		}
+		if !ts.After(until) {
+			finish("reached", "")
+			return
+		}
+		prevAnchor = id
+
+		lastKnown := &types.MessageInfo{
+			MessageSource: types.MessageSource{Chat: jid, IsFromMe: isFromMe},
+			ID:            id,
+			Timestamp:     ts,
+		}
+		historyMsg := client.BuildHistorySyncRequest(lastKnown, backfillPageSize)
+		if historyMsg == nil {
+			finish("error", "failed to build history request")
+			return
+		}
+		if _, err := client.SendPeerMessage(context.Background(), historyMsg); err != nil {
+			finish("error", "history request failed: "+err.Error())
+			return
+		}
+		slog.Info("backfill page requested", "chat_jid", chatJID, "page", page, "anchor", id, "anchor_ts", ts.Format(time.RFC3339))
+
+		select {
+		case got := <-ch:
+			setBackfillStatus(chatJID, func(st *BackfillStatus) {
+				st.Pages = page
+				st.Stored += got.stored
+				if !got.oldest.IsZero() {
+					st.Oldest = got.oldest.UTC().Format(time.RFC3339)
+				}
+			})
+			if got.stored == 0 {
+				finish("exhausted", "")
+				return
+			}
+		case <-time.After(backfillPageTimeout):
+			finish("timeout", "the phone did not answer the history request (it may be offline)")
+			return
+		}
+		time.Sleep(backfillPageGap)
+	}
+	finish("budget", "")
 }
 
 // Request history sync from the server
