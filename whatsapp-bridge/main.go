@@ -834,6 +834,56 @@ func (store *MessageStore) DeleteWaLabel(id string) error {
 	return err
 }
 
+// GetWaLabel returns the current name/colour of a label (deleted ones included:
+// WhatsApp expects the last known values on a delete mutation).
+func (store *MessageStore) GetWaLabel(id string) (name string, color int32, deleted bool, found bool, err error) {
+	q := "SELECT name, color, deleted FROM wa_labels WHERE id = ?"
+	if isPostgres {
+		q = "SELECT name, color, deleted FROM wa_labels WHERE id = $1"
+	}
+	err = store.db.QueryRow(q, id).Scan(&name, &color, &deleted)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", 0, false, false, nil
+	}
+	if err != nil {
+		return "", 0, false, false, err
+	}
+	return name, color, deleted, true, nil
+}
+
+// NextWaLabelID picks the next free label id. WhatsApp labels use small integer
+// ids; deleted rows still count so an id is never reused (reusing one would
+// resurrect that label's old chat associations on other devices).
+func (store *MessageStore) NextWaLabelID() (string, error) {
+	rows, err := store.db.Query("SELECT id FROM wa_labels")
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	max := int64(0)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return "", err
+		}
+		if n, err := strconv.ParseInt(strings.TrimSpace(id), 10, 64); err == nil && n > max {
+			max = n
+		}
+	}
+	return strconv.FormatInt(max+1, 10), rows.Err()
+}
+
+// CountWaChatLabel reports how many chats currently carry a label.
+func (store *MessageStore) CountWaChatLabel(labelID string) (int, error) {
+	q := "SELECT COUNT(*) FROM wa_chat_labels WHERE label_id = ?"
+	if isPostgres {
+		q = "SELECT COUNT(*) FROM wa_chat_labels WHERE label_id = $1"
+	}
+	var n int
+	err := store.db.QueryRow(q, labelID).Scan(&n)
+	return n, err
+}
+
 // SetWaChatLabel adds or removes a label association on a chat.
 func (store *MessageStore) SetWaChatLabel(chatJID, labelID string, labeled bool) error {
 	if !labeled {
@@ -3157,6 +3207,170 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 		respondJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	})
 
+	// ── WhatsApp Business labels (write path) ─────────────────────────────
+	// Labels are app state: every mutation is sent to WhatsApp with
+	// SendAppState so the phone (and other linked devices) pick it up, then
+	// mirrored into wa_labels / wa_chat_labels right away so the manager sees
+	// it without waiting for the echo event. A failed send leaves the mirror
+	// untouched: the UI must never show a label the phone will not have.
+	// Only a WhatsApp Business account has a label UI; the manager gates on
+	// the "business" flag from /auth/status, and these handlers refuse too.
+	requireBusiness := func(w http.ResponseWriter) bool {
+		if client.Store.ID == nil || !client.IsConnected() {
+			respondError(w, http.StatusConflict, "not connected")
+			return false
+		}
+		if !isBusinessAccount(client) {
+			respondError(w, http.StatusBadRequest, "Labels need a WhatsApp Business account")
+			return false
+		}
+		return true
+	}
+
+	// Tag or untag one chat with an existing label.
+	apiMux.HandleFunc("/labels/chat", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			ChatJID string `json:"chat_jid"`
+			LabelID string `json:"label_id"`
+			Labeled bool   `json:"labeled"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ChatJID == "" || body.LabelID == "" {
+			respondError(w, http.StatusBadRequest, "chat_jid and label_id required")
+			return
+		}
+		chat, err := types.ParseJID(body.ChatJID)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, "invalid chat_jid")
+			return
+		}
+		chat = normalizeUserJID(client, chat)
+		if !requireBusiness(w) {
+			return
+		}
+		if _, _, deleted, found, err := messageStore.GetWaLabel(body.LabelID); err != nil {
+			respondError(w, http.StatusInternalServerError, err.Error())
+			return
+		} else if !found || deleted {
+			respondError(w, http.StatusNotFound, "label not found")
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		defer cancel()
+		if err := client.SendAppState(ctx, appstate.BuildLabelChat(chat, body.LabelID, body.Labeled)); err != nil {
+			slog.Warn("labels: send chat label failed", "chat", chat.String(), "label", body.LabelID, "err", err)
+			respondError(w, http.StatusBadGateway, "WhatsApp rejected the label change: "+err.Error())
+			return
+		}
+		if err := messageStore.SetWaChatLabel(chat.String(), body.LabelID, body.Labeled); err != nil {
+			slog.Warn("labels: mirror chat label failed", "chat", chat.String(), "label", body.LabelID, "err", err)
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"ok": true})
+	})
+
+	// Create (empty id) or edit (name / colour) a label.
+	apiMux.HandleFunc("/labels", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			ID    string `json:"id"`
+			Name  string `json:"name"`
+			Color int32  `json:"color"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			respondError(w, http.StatusBadRequest, "invalid body")
+			return
+		}
+		body.Name = strings.TrimSpace(body.Name)
+		if body.Name == "" || len([]rune(body.Name)) > 100 {
+			respondError(w, http.StatusBadRequest, "name must be 1-100 characters")
+			return
+		}
+		if body.Color < 0 || body.Color > 19 {
+			respondError(w, http.StatusBadRequest, "color must be 0-19")
+			return
+		}
+		if !requireBusiness(w) {
+			return
+		}
+		id := strings.TrimSpace(body.ID)
+		if id == "" {
+			next, err := messageStore.NextWaLabelID()
+			if err != nil {
+				respondError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			id = next
+		} else if _, _, deleted, found, err := messageStore.GetWaLabel(id); err != nil {
+			respondError(w, http.StatusInternalServerError, err.Error())
+			return
+		} else if !found || deleted {
+			respondError(w, http.StatusNotFound, "label not found")
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		defer cancel()
+		if err := client.SendAppState(ctx, appstate.BuildLabelEdit(id, body.Name, body.Color, false)); err != nil {
+			slog.Warn("labels: send label edit failed", "label", id, "err", err)
+			respondError(w, http.StatusBadGateway, "WhatsApp rejected the label change: "+err.Error())
+			return
+		}
+		if err := messageStore.UpsertWaLabel(id, body.Name, body.Color, false); err != nil {
+			slog.Warn("labels: mirror label edit failed", "label", id, "err", err)
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"ok": true, "id": id})
+	})
+
+	// DELETE /labels/{id}: soft-delete a label and drop its chat associations.
+	// GET /labels/{id} reports how many chats carry it (for the confirm step).
+	apiMux.HandleFunc("/labels/", func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimPrefix(r.URL.Path, "/labels/")
+		if id == "" || strings.Contains(id, "/") {
+			http.Error(w, "Not found", http.StatusNotFound)
+			return
+		}
+		name, color, deleted, found, err := messageStore.GetWaLabel(id)
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if !found || deleted {
+			respondError(w, http.StatusNotFound, "label not found")
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			n, err := messageStore.CountWaChatLabel(id)
+			if err != nil {
+				respondError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			respondJSON(w, http.StatusOK, map[string]any{"id": id, "name": name, "color": color, "chats": n})
+		case http.MethodDelete:
+			if !requireBusiness(w) {
+				return
+			}
+			ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+			defer cancel()
+			if err := client.SendAppState(ctx, appstate.BuildLabelEdit(id, name, color, true)); err != nil {
+				slog.Warn("labels: send label delete failed", "label", id, "err", err)
+				respondError(w, http.StatusBadGateway, "WhatsApp rejected the label change: "+err.Error())
+				return
+			}
+			if err := messageStore.DeleteWaLabel(id); err != nil {
+				slog.Warn("labels: mirror label delete failed", "label", id, "err", err)
+			}
+			respondJSON(w, http.StatusOK, map[string]any{"ok": true})
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
 	// Stream a typing indicator to a chat without sending a message. Driven by
 	// the manager when an operator is typing in the composer, or by an upstream
 	// caller (e.g. HR-AI) while it generates a reply — so the recipient sees
@@ -3819,6 +4033,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 			"pairing_required": state.PairingRequired(),
 			"wa_version":       state.WAVersion(),
 			"jid":              jid,
+			// Paired to a WhatsApp Business app (labels, catalog…). Known from
+			// the pairing handshake; false until a session exists.
+			"business": client.Store.ID != nil && isBusinessAccount(client),
 		})
 	})
 
@@ -3967,6 +4184,22 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 			slog.Error("rest api server error", "err", err)
 		}
 	}()
+}
+
+// isBusinessAccount reports whether the paired phone runs WhatsApp Business.
+// whatsmeow records the phone's platform at pairing: "smba" (Android Business)
+// and "smbi" (iPhone Business) versus "android" / "iphone" for the personal
+// app. The business name is a second signal for older sessions whose platform
+// string was not persisted.
+func isBusinessAccount(client *whatsmeow.Client) bool {
+	if client == nil || client.Store == nil {
+		return false
+	}
+	switch strings.ToLower(client.Store.Platform) {
+	case "smba", "smbi":
+		return true
+	}
+	return client.Store.BusinessName != ""
 }
 
 func respondJSON(w http.ResponseWriter, status int, data interface{}) {
