@@ -1548,8 +1548,20 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	// Keyed by message ID, so a later sync from another device just upserts.
 	if messageStore != nil && client.Store.ID != nil {
 		sender := client.Store.ID.ToNonAD().String()
+		chatJID := recipientJID.String()
+		sentAt := time.Now()
+		// messages.chat_jid references chats(jid), so the chat row must exist
+		// before the message row. The inbound handler and history sync both
+		// upsert it first; a send to a contact we have never stored a chat for
+		// (new contact, or a chat history sync never delivered) otherwise fails
+		// the FK and the sent message is lost from history for good.
+		if storeErr := messageStore.StoreChat(
+			chatJID, GetChatName(client, messageStore, recipientJID, chatJID, nil, sender, waLog.Noop), sentAt,
+		); storeErr != nil {
+			slog.Warn("failed to store chat for sent message", "error", storeErr)
+		}
 		if storeErr := messageStore.StoreMessage(
-			sendResp.ID, recipientJID.String(), sender, message, time.Now(), true,
+			sendResp.ID, chatJID, sender, message, sentAt, true,
 			stMediaType, stFilename, stURL, stMediaKey, stFileSHA, stFileEncSHA, stFileLen,
 			quotedID, quotedParticipant, quotedText, isForwarded,
 		); storeErr != nil {
