@@ -155,6 +155,18 @@ var displayLoc = func() *time.Location {
 	return loc
 }()
 
+// trimIdlePool keeps a quiet bridge from pinning Postgres connections. Every
+// number runs its own bridge with two pools (message store + session store), and
+// database/sql's default of two idle connections each held ~3.3 server
+// connections per line even when nothing was happening, which is what caps how
+// many lines one Postgres can serve. Busy lines are unaffected: the number of
+// OPEN connections stays unlimited, because whatsmeow can query outside a
+// transaction it is holding and a hard cap could deadlock it.
+func trimIdlePool(db *sql.DB) {
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxIdleTime(5 * time.Minute)
+}
+
 func openDatabase(dbName string) (*sql.DB, error) {
 	if val, ok := os.LookupEnv("IS_POSTGRES"); ok && strings.ToLower(val) == "true" {
 		cfg, err := config.LoadConfig()
@@ -166,7 +178,12 @@ func openDatabase(dbName string) (*sql.DB, error) {
 		connStr := fmt.Sprintf("postgresql://%s:%s@%s:%s/%s?sslmode=disable",
 			cfg.DB.User, cfg.DB.Pass, cfg.DB.Host, cfg.DB.Port, dbName)
 		log.Println("Connecting to postgres")
-		return sql.Open("postgres", connStr)
+		db, err := sql.Open("postgres", connStr)
+		if err != nil {
+			return nil, err
+		}
+		trimIdlePool(db)
+		return db, nil
 	}
 
 	// Fallback to SQLite
@@ -5831,8 +5848,18 @@ func main() {
 			cfg.DB.Pass, cfg.DB.Host, cfg.DB.Port, "whatsapp")
 	}
 
-	container, err := sqlstore.New(context.Background(), dialect, connStr, dbLog)
+	// Opened here rather than via sqlstore.New so the session store's pool gets
+	// the same idle trimming as the message store's.
+	storeDB, err := sql.Open(dialect, connStr)
 	if err != nil {
+		logger.Errorf("Failed to connect to database: %v", err)
+		return
+	}
+	if cfg.DB.IsPostgres {
+		trimIdlePool(storeDB)
+	}
+	container := sqlstore.NewWithDB(storeDB, dialect, dbLog)
+	if err := container.Upgrade(context.Background()); err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
