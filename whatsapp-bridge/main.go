@@ -4490,6 +4490,12 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			// decide whether to page further back.
 			var oldestStored time.Time
 			convStored := 0
+			// Set once this conversation's chat row is known to exist. A chat the
+			// store has never seen has no row, and messages.chat_jid references
+			// chats(jid): without this every message of a new chat failed the
+			// foreign key, nothing was stored, and so the row bumped after the
+			// loop was never written either — a fresh store synced zero history.
+			chatEnsured := false
 
 			for _, msg := range messages {
 				if msg == nil || msg.Message == nil {
@@ -4569,6 +4575,17 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 
 				quotedID, quotedSender, quotedContent := quotedFromMessage(unwrapMessage(msg.Message.Message))
 				isForwarded := contextInfoOf(unwrapMessage(msg.Message.Message)).GetIsForwarded()
+
+				// Stamped with this message's own time: it is about to be stored,
+				// so the chat never claims a time no message backs (554842b), and
+				// StoreChat only ever moves last_message_time forward.
+				if !chatEnsured {
+					if err := messageStore.StoreChat(chatJID, name, timestamp); err != nil {
+						logger.Warnf("Failed to store chat: %v", err)
+					} else {
+						chatEnsured = true
+					}
+				}
 
 				err = messageStore.StoreMessage(
 					msgID,
