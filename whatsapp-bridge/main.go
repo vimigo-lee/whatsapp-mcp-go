@@ -3140,6 +3140,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 		respondJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	})
 
+	// History replay (history_replay.go): re-download the saved pairing-upload
+	// files and store them again, with no request to the phone.
+	apiMux.HandleFunc("/history-replay", handleHistoryReplay(client, messageStore))
+
 	// Per-chat history backfill — walks WhatsApp's on-demand history backwards
 	// for one chat without re-pairing. POST starts it, GET reports progress.
 	apiMux.HandleFunc("/backfill", func(w http.ResponseWriter, r *http.Request) {
@@ -5959,6 +5963,9 @@ func main() {
 		return
 	}
 	defer messageStore.Close()
+	if err := ensureHistoryNotificationTable(messageStore); err != nil {
+		logger.Warnf("Failed to create history_sync_notifications: %v", err)
+	}
 
 	state.SetLoggedIn(client.Store.ID != nil) // existing session means already logged in
 
@@ -5969,6 +5976,7 @@ func main() {
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
+			saveHistoryNotification(messageStore, v)
 			handleMessage(client, messageStore, v, logger)
 
 		case *events.HistorySync:
