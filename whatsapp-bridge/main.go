@@ -484,6 +484,46 @@ func (store *MessageStore) GetReactions(msgID string) []string {
 	return out
 }
 
+// groupAddressing caches each group's addressing mode (phone number or LID).
+// It practically never changes, and a reaction burst during a live vote must
+// not cost a group-info round trip per reaction.
+var groupAddressing sync.Map // types.JID -> types.AddressingMode
+
+// reactionParticipant returns the participant a group reaction's key must
+// carry. Phones match a reaction against the target's whole key, and a
+// LID-addressed group keys its messages by the author's @lid — a reaction keyed
+// by their phone JID is delivered but never shown. Callers (the webhook, the
+// bots) only ever see the phone, so the bridge maps it back to the LID here.
+// Phone-addressed groups, unknown mappings and lookup failures keep the
+// sender as given.
+func reactionParticipant(client *whatsmeow.Client, group, sender types.JID) types.JID {
+	if sender.Server == types.HiddenUserServer {
+		return sender
+	}
+	mode, ok := groupAddressing.Load(group)
+	if !ok {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		info, err := client.GetGroupInfo(ctx, group)
+		cancel()
+		if err != nil || info == nil {
+			slog.Warn("react: group info lookup failed; keeping phone participant", "group", group, "error", err)
+			return sender
+		}
+		mode = info.AddressingMode
+		groupAddressing.Store(group, mode)
+	}
+	if mode != types.AddressingModeLID || client.Store == nil || client.Store.LIDs == nil {
+		return sender
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	lid, err := client.Store.LIDs.GetLIDForPN(ctx, sender.ToNonAD())
+	if err != nil || lid.IsEmpty() {
+		return sender
+	}
+	return lid
+}
+
 // normalizeUserJID converts a LID JID (xxxx@lid) into a phone-number JID (xxxx@s.whatsapp.net)
 // using the whatsmeow LID mapping store. Non-LID JIDs are returned unchanged.
 func normalizeUserJID(client *whatsmeow.Client, jid types.JID) types.JID {
@@ -2936,7 +2976,11 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 				respondError(w, http.StatusBadRequest, fmt.Sprintf("invalid sender: %v", err))
 				return
 			}
-			sender = normalizeUserJID(client, sender)
+			if chatJID.Server == types.GroupServer {
+				sender = reactionParticipant(client, chatJID, sender)
+			} else {
+				sender = normalizeUserJID(client, sender)
+			}
 		} else {
 			sender = chatJID
 		}
