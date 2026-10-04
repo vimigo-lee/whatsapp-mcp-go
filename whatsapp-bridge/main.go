@@ -484,6 +484,37 @@ func (store *MessageStore) GetReactions(msgID string) []string {
 	return out
 }
 
+// senderCache remembers the exact JID each recent group message arrived under
+// (its key's participant, @lid in a LID-addressed group), bounded FIFO.
+type senderCache struct {
+	mu    sync.Mutex
+	byID  map[string]types.JID
+	order []string
+	max   int
+}
+
+func (c *senderCache) remember(msgID string, sender types.JID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.byID[msgID]; !ok {
+		c.order = append(c.order, msgID)
+		if len(c.order) > c.max {
+			delete(c.byID, c.order[0])
+			c.order = c.order[1:]
+		}
+	}
+	c.byID[msgID] = sender
+}
+
+func (c *senderCache) lookup(msgID string) (types.JID, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	j, ok := c.byID[msgID]
+	return j, ok
+}
+
+var groupSenders = &senderCache{byID: map[string]types.JID{}, max: 50000}
+
 // groupAddressing caches each group's addressing mode (phone number or LID).
 // It practically never changes, and a reaction burst during a live vote must
 // not cost a group-info round trip per reaction.
@@ -496,7 +527,13 @@ var groupAddressing sync.Map // types.JID -> types.AddressingMode
 // bots) only ever see the phone, so the bridge maps it back to the LID here.
 // Phone-addressed groups, unknown mappings and lookup failures keep the
 // sender as given.
-func reactionParticipant(client *whatsmeow.Client, group, sender types.JID) types.JID {
+func reactionParticipant(client *whatsmeow.Client, group types.JID, msgID string, sender types.JID) types.JID {
+	// Best source: the participant the target message actually arrived under.
+	// Mapping phone -> LID below can miss (mode reported as pn, or no mapping
+	// in the store), and a miss is an invisible reaction.
+	if raw, ok := groupSenders.lookup(msgID); ok {
+		return raw
+	}
 	if sender.Server == types.HiddenUserServer {
 		return sender
 	}
@@ -513,12 +550,14 @@ func reactionParticipant(client *whatsmeow.Client, group, sender types.JID) type
 		groupAddressing.Store(group, mode)
 	}
 	if mode != types.AddressingModeLID || client.Store == nil || client.Store.LIDs == nil {
+		slog.Info("react: group not LID-addressed; phone participant", "group", group, "mode", mode)
 		return sender
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	lid, err := client.Store.LIDs.GetLIDForPN(ctx, sender.ToNonAD())
 	if err != nil || lid.IsEmpty() {
+		slog.Warn("react: no LID mapping for sender; keeping phone participant", "group", group, "sender", sender, "error", err)
 		return sender
 	}
 	return lid
@@ -2977,7 +3016,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 				return
 			}
 			if chatJID.Server == types.GroupServer {
-				sender = reactionParticipant(client, chatJID, sender)
+				sender = reactionParticipant(client, chatJID, req.MessageID, sender)
 			} else {
 				sender = normalizeUserJID(client, sender)
 			}
@@ -6021,6 +6060,9 @@ func main() {
 		switch v := evt.(type) {
 		case *events.Message:
 			saveHistoryNotification(messageStore, v)
+			if v.Info.IsGroup && !v.Info.IsFromMe {
+				groupSenders.remember(v.Info.ID, v.Info.Sender.ToNonAD())
+			}
 			handleMessage(client, messageStore, v, logger)
 
 		case *events.HistorySync:
