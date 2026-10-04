@@ -534,6 +534,11 @@ func reactionParticipant(client *whatsmeow.Client, group types.JID, msgID string
 	if raw, ok := groupSenders.lookup(msgID); ok {
 		return raw
 	}
+	// Callers send bare phone digits ("60123456789"), which ParseJID leaves
+	// without a server — not a phone JID, so the LID lookup rejects it.
+	if sender.Server == "" {
+		sender = types.NewJID(sender.User, types.DefaultUserServer)
+	}
 	if sender.Server == types.HiddenUserServer {
 		return sender
 	}
