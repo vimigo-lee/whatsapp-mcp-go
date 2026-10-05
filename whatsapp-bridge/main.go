@@ -534,11 +534,6 @@ func reactionParticipant(client *whatsmeow.Client, group types.JID, msgID string
 	if raw, ok := groupSenders.lookup(msgID); ok {
 		return raw
 	}
-	// Callers send bare phone digits ("60123456789"), which ParseJID leaves
-	// without a server — not a phone JID, so the LID lookup rejects it.
-	if sender.Server == "" {
-		sender = types.NewJID(sender.User, types.DefaultUserServer)
-	}
 	if sender.Server == types.HiddenUserServer {
 		return sender
 	}
@@ -3015,6 +3010,13 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 				sender = client.Store.ID.ToNonAD()
 			}
 		} else if req.Sender != "" {
+			// Callers send the author as bare phone digits ("60123456789"), and
+			// ParseJID reads an @-less string as a SERVER, not a user — the LID
+			// lookup then rejects it and the reaction keys an unmatchable
+			// participant. Bare digits are a phone number.
+			if !strings.Contains(req.Sender, "@") {
+				req.Sender += "@" + types.DefaultUserServer
+			}
 			sender, err = types.ParseJID(req.Sender)
 			if err != nil {
 				respondError(w, http.StatusBadRequest, fmt.Sprintf("invalid sender: %v", err))
