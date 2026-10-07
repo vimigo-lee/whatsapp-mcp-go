@@ -24,12 +24,14 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 	_ "time/tzdata" // embed the IANA zoneinfo DB so BRIDGE_TZ works on bare alpine
+	"unicode"
 	"whatsapp-bridge/auth"
 	"whatsapp-bridge/config"
 	bridgelogger "whatsapp-bridge/logger"
@@ -42,6 +44,9 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
 	qrcode "github.com/skip2/go-qrcode"
+	"golang.org/x/text/runes"
+	"golang.org/x/text/transform"
+	"golang.org/x/text/unicode/norm"
 
 	"bytes"
 
@@ -88,6 +93,7 @@ func (c *Chat) IsGroup() bool {
 type Contact struct {
 	PhoneNumber string `json:"phone_number"`
 	Name        string `json:"name,omitempty"`
+	Username    string `json:"username,omitempty"`
 	JID         string `json:"jid"`
 }
 
@@ -327,6 +333,13 @@ func NewMessageStore() (*MessageStore, error) {
 			chat_jid TEXT NOT NULL,
 			label_id TEXT NOT NULL,
 			PRIMARY KEY (chat_jid, label_id)
+		);
+
+		-- WhatsApp @usernames. whatsmeow receives them (contact app-state, history
+		-- sync) but its whatsmeow_contacts table has no column for them.
+		CREATE TABLE IF NOT EXISTS contact_usernames (
+			jid TEXT PRIMARY KEY,
+			username TEXT NOT NULL
 		);
 	`, blobType, blobType, blobType))
 	if err != nil {
@@ -4560,6 +4573,10 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 		jid = normalizeUserJID(client, jid)
 		chatJID = jid.String()
 
+		if u := conversation.GetUsername(); u != "" {
+			messageStore.SaveContactUsername(chatJID, u)
+		}
+
 		name := GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
 
 		messages := conversation.Messages
@@ -5628,55 +5645,103 @@ func (store *MessageStore) ListChats(
 	return chats, nil
 }
 
+func (store *MessageStore) SaveContactUsername(jid, username string) {
+	username = strings.TrimPrefix(username, "@")
+	q := `INSERT INTO contact_usernames (jid, username) VALUES (?, ?)
+		ON CONFLICT (jid) DO UPDATE SET username = excluded.username`
+	if isPostgres {
+		q = `INSERT INTO contact_usernames (jid, username) VALUES ($1, $2)
+		ON CONFLICT (jid) DO UPDATE SET username = EXCLUDED.username`
+	}
+	if _, err := store.db.Exec(q, jid, username); err != nil {
+		slog.Warn("failed to save contact username", "jid", jid, "err", err)
+	}
+}
+
+// foldText lowercases and strips diacritics so "Yëë Jïün" matches "yee jiun".
+var foldTransformer = transform.Chain(norm.NFD, runes.Remove(runes.In(unicode.Mn)), norm.NFC)
+
+func foldText(s string) string {
+	out, _, err := transform.String(foldTransformer, s)
+	if err != nil {
+		out = s
+	}
+	return strings.ToLower(out)
+}
+
+// SearchContacts matches the query against every stored name (saved, push and
+// business), the @username and the JID, ignoring case and accents. Matching runs
+// in Go because SQL LOWER/LIKE can't fold accents portably across SQLite and
+// Postgres; the contact table is small enough to scan.
 func (store *MessageStore) SearchContacts(query string) ([]Contact, error) {
-	placeholder := func(n int) string {
-		if isPostgres {
-			return fmt.Sprintf("$%d", n)
-		}
-		return "?"
+	needle := foldText(strings.TrimPrefix(strings.TrimSpace(query), "@"))
+	if needle == "" {
+		return nil, nil
 	}
 
-	q := `
-        SELECT DISTINCT their_jid, first_name
-        FROM whatsmeow_contacts
-        WHERE (LOWER(first_name) LIKE LOWER(` + placeholder(1) + `)
-           OR LOWER(their_jid) LIKE LOWER(` + placeholder(2) + `))
-          AND their_jid NOT LIKE '%@g.us'
-        ORDER BY first_name, their_jid
-        LIMIT 50
-    `
-
-	args := []any{"%" + query + "%", "%" + query + "%"}
-
-	rows, err := store.db.Query(q, args...)
+	rows, err := store.db.Query(`
+        SELECT c.their_jid, c.first_name, c.full_name, c.push_name, c.business_name, u.username
+        FROM whatsmeow_contacts c
+        LEFT JOIN contact_usernames u ON u.jid = c.their_jid
+        WHERE c.their_jid NOT LIKE '%@g.us'
+        UNION
+        SELECT u.jid, NULL, NULL, NULL, NULL, u.username
+        FROM contact_usernames u
+        WHERE NOT EXISTS (SELECT 1 FROM whatsmeow_contacts c WHERE c.their_jid = u.jid)
+    `)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
+	seen := make(map[string]bool)
 	var contacts []Contact
 
 	for rows.Next() {
-		var jid, name sql.NullString
-
-		if err := rows.Scan(&jid, &name); err != nil {
+		var jid, first, full, push, business, username sql.NullString
+		if err := rows.Scan(&jid, &first, &full, &push, &business, &username); err != nil {
 			continue
 		}
-		if !jid.Valid {
+		if !jid.Valid || seen[jid.String] {
 			continue
 		}
 
-		phone := strings.Split(jid.String, "@")[0]
+		names := []string{first.String, full.String, push.String, business.String}
+		matched := strings.Contains(foldText(jid.String), needle) ||
+			(username.Valid && strings.Contains(foldText(username.String), needle))
+		for _, n := range names {
+			if matched {
+				break
+			}
+			matched = n != "" && strings.Contains(foldText(n), needle)
+		}
+		if !matched {
+			continue
+		}
+		seen[jid.String] = true
 
 		c := Contact{
-			PhoneNumber: phone,
+			PhoneNumber: strings.Split(jid.String, "@")[0],
 			JID:         jid.String,
+			Username:    username.String,
 		}
-		if name.Valid {
-			c.Name = name.String
+		for _, n := range names {
+			if n != "" {
+				c.Name = n
+				break
+			}
 		}
-
 		contacts = append(contacts, c)
+	}
+
+	sort.Slice(contacts, func(i, j int) bool {
+		if contacts[i].Name != contacts[j].Name {
+			return contacts[i].Name < contacts[j].Name
+		}
+		return contacts[i].JID < contacts[j].JID
+	})
+	if len(contacts) > 50 {
+		contacts = contacts[:50]
 	}
 
 	return contacts, nil
@@ -6066,6 +6131,16 @@ func main() {
 
 		case *events.HistorySync:
 			handleHistorySync(client, messageStore, v, logger)
+
+		case *events.Contact:
+			if u := v.Action.GetUsername(); u != "" {
+				messageStore.SaveContactUsername(v.JID.ToNonAD().String(), u)
+				for _, alt := range []string{v.Action.GetPnJID(), v.Action.GetLidJID()} {
+					if alt != "" {
+						messageStore.SaveContactUsername(alt, u)
+					}
+				}
+			}
 
 		case *events.Receipt:
 			// Clear the unread badge when *we* read the chat elsewhere (phone or
