@@ -1,5 +1,5 @@
 # Build the manager binary
-FROM golang:1.25.7 AS builder
+FROM golang:1.26 AS builder
 
 ARG TARGETARCH
 ARG TARGETOS
@@ -17,7 +17,7 @@ RUN go mod download
 COPY . .
 
 # Build
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} GO111MODULE=on go build -a -o whatsapp-bridge main.go
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} GO111MODULE=on go build -a -o whatsapp-bridge .
 
 # Use distroless as minimal base image to package the manager binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
