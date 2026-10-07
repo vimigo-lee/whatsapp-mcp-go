@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -398,7 +399,7 @@ func searchContactsHandler(
 		return ErrResult("query is required"), nil, nil
 	}
 
-	data, err := callAPI(http.MethodGet, "/contacts/search?q="+in.Query, nil)
+	data, err := callAPI(http.MethodGet, "/contacts/search?q="+url.QueryEscape(in.Query), nil)
 	if err != nil {
 		return ErrResult(err.Error()), nil, nil
 	}
@@ -421,19 +422,19 @@ func listMessagesHandler(
 ) (*mcp.CallToolResult, any, error) {
 	q := ""
 	if in.After != nil {
-		q += "&after=" + *in.After
+		q += "&after=" + url.QueryEscape(*in.After)
 	}
 	if in.Before != nil {
-		q += "&before=" + *in.Before
+		q += "&before=" + url.QueryEscape(*in.Before)
 	}
 	if in.SenderPhoneNumber != nil {
-		q += "&sender=" + *in.SenderPhoneNumber
+		q += "&sender=" + url.QueryEscape(*in.SenderPhoneNumber)
 	}
 	if in.ChatJid != nil {
-		q += "&chat=" + *in.ChatJid
+		q += "&chat=" + url.QueryEscape(*in.ChatJid)
 	}
 	if in.Query != nil {
-		q += "&search=" + *in.Query
+		q += "&search=" + url.QueryEscape(*in.Query)
 	}
 	q += fmt.Sprintf("&limit=%d&page=%d", in.Limit, in.Page)
 	if in.IncludeContext {
@@ -505,7 +506,7 @@ func listChatsHandler(
 ) (*mcp.CallToolResult, any, error) {
 	q := fmt.Sprintf("?limit=%d&page=%d", in.Limit, in.Page)
 	if in.Query != nil && *in.Query != "" {
-		q += "&q=" + *in.Query
+		q += "&q=" + url.QueryEscape(*in.Query)
 	}
 	if in.SortBy != "" {
 		q += "&sort=" + in.SortBy
@@ -632,7 +633,7 @@ func getLastInteractionHandler(
 	}
 
 	// We simulate it by asking for 1 message from that sender
-	data, err := callAPI(http.MethodGet, "/messages?sender="+in.Jid+"&limit=1", nil)
+	data, err := callAPI(http.MethodGet, "/messages?sender="+url.QueryEscape(in.Jid)+"&limit=1", nil)
 	if err != nil {
 		return ErrResult(err.Error()), nil, nil
 	}
