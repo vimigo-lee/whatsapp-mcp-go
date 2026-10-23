@@ -43,8 +43,8 @@ func voiceNote(preSkip uint16, inputRate uint32, seconds uint64) []byte {
 }
 
 func TestAnalyzeOggOpusDuration(t *testing.T) {
-	// The old parser read pre-skip / sample rate 8 bytes too far (into the next
-	// page header) and declared every voice note 1 second long.
+	// The old parser read pre-skip / sample rate 8 bytes too far, so it missed
+	// the header in a standard stream and rounded every note a second long.
 	for _, tc := range []struct {
 		name      string
 		inputRate uint32

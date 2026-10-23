@@ -5064,9 +5064,7 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 		}
 
 		if !foundOpusHead && pageSeqNum <= 1 && i+pageSize <= len(data) {
-			// The OpusHead fields sit at fixed offsets after the magic. The
-			// previous parser read them 8 bytes too far (into the next page), so
-			// every voice note was declared 1 second long.
+			// The OpusHead fields sit at fixed offsets after the magic.
 			if ps, rate, ok := opusHead(data[i : i+pageSize]); ok {
 				preSkip = ps
 				foundOpusHead = true
