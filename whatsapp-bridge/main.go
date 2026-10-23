@@ -5010,6 +5010,20 @@ func normalizeVoiceNoteMimetype(mt string) string {
 	return mt
 }
 
+// opusHead reads the OpusHead identification header (RFC 7845 §5.1) from an
+// Ogg page: "OpusHead"(8) version(1) channels(1) pre-skip(2, LE)
+// input-sample-rate(4, LE) gain(2) mapping-family(1). It never reads past the
+// page. The input sample rate is informational only — Opus granule positions
+// always count 48 kHz samples.
+func opusHead(page []byte) (preSkip uint16, inputRate uint32, ok bool) {
+	pos := bytes.Index(page, []byte("OpusHead"))
+	if pos < 0 || pos+19 > len(page) {
+		return 0, 0, false
+	}
+	h := page[pos+8:]
+	return binary.LittleEndian.Uint16(h[2:4]), binary.LittleEndian.Uint32(h[4:8]), true
+}
+
 // analyzeOggOpus tries to extract duration and generate a simple waveform from an Ogg Opus file
 func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 	// Try to detect if this is a valid Ogg file by checking for the "OggS" signature
@@ -5018,9 +5032,10 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 		return 0, nil, fmt.Errorf("not a valid Ogg file (missing OggS signature)")
 	}
 
-	// Parse Ogg pages to find the last page with a valid granule position
+	// Parse Ogg pages to find the last page with a valid granule position.
+	// Opus granule positions always count 48 kHz samples (RFC 7845 §4).
+	const opusGranuleRate = 48000
 	var lastGranule uint64
-	var sampleRate uint32 = 48000 // Default Opus sample rate
 	var preSkip uint16 = 0
 	var foundOpusHead bool
 
@@ -5048,17 +5063,14 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 			pageSize += int(segLen)
 		}
 
-		if !foundOpusHead && pageSeqNum <= 1 {
-			pageData := data[i : i+pageSize]
-			headPos := bytes.Index(pageData, []byte("OpusHead"))
-			if headPos >= 0 && headPos+12 < len(pageData) {
-				headPos += 8
-				if headPos+12 <= len(pageData) {
-					preSkip = binary.LittleEndian.Uint16(pageData[headPos+10 : headPos+12])
-					sampleRate = binary.LittleEndian.Uint32(pageData[headPos+12 : headPos+16])
-					foundOpusHead = true
-					slog.Info("found OpusHead", "sample_rate", sampleRate, "pre_skip", preSkip)
-				}
+		if !foundOpusHead && pageSeqNum <= 1 && i+pageSize <= len(data) {
+			// The OpusHead fields sit at fixed offsets after the magic. The
+			// previous parser read them 8 bytes too far (into the next page), so
+			// every voice note was declared 1 second long.
+			if ps, rate, ok := opusHead(data[i : i+pageSize]); ok {
+				preSkip = ps
+				foundOpusHead = true
+				slog.Info("found OpusHead", "input_sample_rate", rate, "pre_skip", preSkip)
 			}
 		}
 
@@ -5073,8 +5085,8 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 		slog.Warn("opushead not found, using default values")
 	}
 
-	if lastGranule > 0 {
-		durationSeconds := float64(lastGranule-uint64(preSkip)) / float64(sampleRate)
+	if lastGranule > uint64(preSkip) {
+		durationSeconds := float64(lastGranule-uint64(preSkip)) / opusGranuleRate
 		duration = uint32(math.Ceil(durationSeconds))
 		slog.Info("calculated Opus duration from granule", "duration_seconds", durationSeconds, "last_granule", lastGranule)
 	} else {
