@@ -241,7 +241,7 @@ type listChatsInput struct {
 	Page               int     `json:"page" jsonschema:"default:0"`
 	IncludeLastMessage bool    `json:"include_last_message" jsonschema:"default:true"`
 	SortBy             string  `json:"sort_by" jsonschema:"default:last_active,enum:last_active|name"`
-	UnreadOnly         bool    `json:"unread_only" jsonschema:"default:false,description:Only return chats that have unread messages"`
+	UnreadOnly         bool    `json:"unread_only,omitempty" jsonschema:"default:false,description:Only return chats that have unread messages"`
 }
 
 type markReadInput struct {
