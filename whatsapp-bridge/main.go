@@ -1361,6 +1361,10 @@ func sendChatPresence(client *whatsmeow.Client, jid types.JID, state types.ChatP
 	}
 	if err := client.SendPresence(context.Background(), types.PresenceAvailable); err != nil {
 		slog.Debug("send available presence failed", "err", err)
+	} else {
+		// Go back offline 1–3 minutes after the last send instead of staying
+		// online (and muting the owner's phone) until the next reconnect.
+		presence.extend(client)
 	}
 	if err := client.SendChatPresence(context.Background(), jid, state, types.ChatPresenceMediaText); err != nil {
 		slog.Debug("send chat presence failed", "jid", jid.String(), "state", string(state), "err", err)
@@ -6310,6 +6314,7 @@ func main() {
 			outdatedRetriesMu.Lock()
 			outdatedRetries = 0
 			outdatedRetriesMu.Unlock()
+			presence.start(client)
 
 		case *events.Disconnected:
 			logger.Warnf("Disconnected from WhatsApp")
