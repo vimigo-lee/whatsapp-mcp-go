@@ -360,6 +360,9 @@ func callAPI(method, path string, body any) ([]byte, error) {
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+	// Tells the bridge this call is the customer using WhatsApp through MCP, so
+	// it can show the linked device as active (see presence_sessions.go).
+	req.Header.Set("X-Wamcp-Activity", "mcp")
 
 	client := &http.Client{Timeout: apiTimeout}
 	resp, err := client.Do(req)

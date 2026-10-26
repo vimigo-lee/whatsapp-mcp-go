@@ -40,3 +40,32 @@ func TestRandDurationBounds(t *testing.T) {
 		t.Fatalf("randDuration(min == max) = %v, want %v", d, time.Minute)
 	}
 }
+
+func TestPresenceReadThrottle(t *testing.T) {
+	p := &presenceSessions{}
+
+	p.read(nil)
+	first := p.lastRead
+	if first.IsZero() {
+		t.Fatal("first read should open a session")
+	}
+
+	p.read(nil)
+	if !p.lastRead.Equal(first) {
+		t.Fatal("a second read within the hour must not open another session")
+	}
+
+	hourAgo := time.Now().Add(-presenceReadEvery)
+	p.lastRead = hourAgo
+	p.online = true
+	p.read(nil)
+	if !p.lastRead.Equal(hourAgo) {
+		t.Fatal("a read while already online must not open a session")
+	}
+
+	p.online = false
+	p.read(nil)
+	if time.Since(p.lastRead) > time.Minute {
+		t.Fatal("a read after the hour should open a new session")
+	}
+}

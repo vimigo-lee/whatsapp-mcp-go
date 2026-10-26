@@ -188,5 +188,6 @@ func shareGroupHistoryNative(ctx context.Context, client *whatsmeow.Client, stor
 		return res, fmt.Errorf("history shared, but the group notice failed: %w", err)
 	}
 	res.NoticeSent = true
+	presence.active(client)
 	return res, nil
 }

@@ -12,8 +12,12 @@ package main
 // Being available has visible side effects: contacts see "online" and the
 // owner's phone mutes notifications. So the bridge behaves like a person with
 // WhatsApp Web open for a moment, never like a timer:
-//   - after it goes available to send (typing indicator), it stays online for a
-//     random 1–3 minutes past the last send, then goes unavailable;
+//   - every send (with or without the typing delay, edits, reactions and
+//     revokes too) goes available and stays online for a random 1–3 minutes
+//     past the last send, then goes unavailable;
+//   - an MCP read (a request tagged with presenceActivityHeader) opens the
+//     same kind of session, at most once per presenceReadEvery, so an agent
+//     polling list_messages does not keep the line online all day;
 //   - a line that has not been active for a random 1–3 days opens one 1–3
 //     minute session at a random minute in local daytime.
 // Nothing is tied to reconnects, which happen on every deploy.
@@ -22,6 +26,7 @@ import (
 	"context"
 	"log/slog"
 	"math/rand"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -45,6 +50,12 @@ const (
 	// presenceStartChance per check, so the start minute is spread out.
 	presenceCheckEvery  = 10 * time.Minute
 	presenceStartChance = 1.0 / 3
+	// An MCP read opens at most one session this often; reads while the line
+	// is already online do not extend it (only sends do).
+	presenceReadEvery = 1 * time.Hour
+	// The MCP server tags its bridge calls with this header (value "mcp"), so
+	// the manager's own reads (dashboard, crons, health) never count.
+	presenceActivityHeader = "X-Wamcp-Activity"
 	// Last-active time survives restarts here (the bridge's working dir).
 	presenceStateFile = "store/presence_last_active"
 )
@@ -58,6 +69,7 @@ type presenceSessions struct {
 	timer      *time.Timer
 	lastActive time.Time
 	nextIdle   time.Duration
+	lastRead   time.Time
 }
 
 var presence = &presenceSessions{}
@@ -130,6 +142,42 @@ func (p *presenceSessions) extend(client *whatsmeow.Client) {
 		p.timer.Stop()
 	}
 	p.timer = time.AfterFunc(time.Until(p.offAt), p.goOffline)
+}
+
+// active goes available and keeps the line online 1–3 minutes from now. Called
+// after every send; best-effort, never fails the caller.
+func (p *presenceSessions) active(client *whatsmeow.Client) {
+	if client == nil || !client.IsConnected() || client.Store.ID == nil {
+		return
+	}
+	if err := client.SendPresence(context.Background(), types.PresenceAvailable); err != nil {
+		slog.Debug("presence session: available failed", "err", err)
+		return
+	}
+	p.extend(client)
+}
+
+// read opens a session for an MCP read, unless the line is already online or
+// a read opened one within presenceReadEvery.
+func (p *presenceSessions) read(client *whatsmeow.Client) {
+	p.mu.Lock()
+	if p.online || time.Since(p.lastRead) < presenceReadEvery {
+		p.mu.Unlock()
+		return
+	}
+	p.lastRead = time.Now()
+	p.mu.Unlock()
+	p.active(client)
+}
+
+// presenceActivityMiddleware counts MCP-tagged API requests as reads.
+func presenceActivityMiddleware(client *whatsmeow.Client, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get(presenceActivityHeader) == "mcp" {
+			go presence.read(client)
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (p *presenceSessions) goOffline() {

@@ -1671,6 +1671,8 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err), ""
 	}
+	// Every send keeps the linked device "active", with or without the delay.
+	presence.active(client)
 
 	// Persist our own outgoing message — WhatsApp does not echo it back to the
 	// sending device, so this is the only way it lands in the chat view/store.
@@ -2916,6 +2918,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 			respondError(w, http.StatusInternalServerError, fmt.Sprintf("failed to send edit: %v", err))
 			return
 		}
+		presence.active(client)
 		if messageStore != nil {
 			if err := messageStore.UpdateMessageContent(chatJID.String(), req.MessageID, req.NewText+" (edited)"); err != nil {
 				slog.Warn("failed to update edited message in store", "error", err)
@@ -2959,6 +2962,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 			respondError(w, http.StatusInternalServerError, fmt.Sprintf("failed to send revoke: %v", err))
 			return
 		}
+		presence.active(client)
 		if messageStore != nil {
 			if err := messageStore.DeleteMessage(chatJID.String(), req.MessageID); err != nil {
 				slog.Warn("failed to mark revoked message in store", "error", err)
@@ -3032,6 +3036,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 			respondError(w, http.StatusInternalServerError, fmt.Sprintf("failed to send reaction: %v", err))
 			return
 		}
+		presence.active(client)
 		if messageStore != nil {
 			var own string
 			if client.Store.ID != nil {
@@ -4264,7 +4269,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 	})
 
 	// Authentication
-	protected := auth.JwtAuthMiddleware(cfg, apiMux)
+	protected := auth.JwtAuthMiddleware(cfg, presenceActivityMiddleware(client, apiMux))
 	http.Handle("/api/", http.StripPrefix("/api", protected))
 	http.Handle("/auth/login", auth.LoginHandler(cfg))
 
