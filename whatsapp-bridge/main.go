@@ -1658,6 +1658,12 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		}
 	}
 
+	// Links get the title/thumbnail card the phone app would build; the
+	// recipient never fetches it, so without this every link arrives bare.
+	if mediaPath == "" && mediaBase64 == "" {
+		attachLinkPreview(client, msg, message)
+	}
+
 	// Humanize delivery: show a typing indicator and wait a randomized delay
 	// before sending, so automated traffic does not fire as an instant burst on a
 	// fixed cadence (the fingerprint that gets numbers restricted). Skipped for
