@@ -5305,13 +5305,17 @@ func (store *MessageStore) ListMessages(s ListMessagesParams) (string, error) {
         JOIN chats c ON m.chat_jid = c.jid
     `
 
+	// Rows hold the bridge's local wall-clock time (UTC in our containers): the
+	// Postgres TIMESTAMP column drops the offset on write and when comparing,
+	// and SQLite compares the stored strings. So "09:00+08:00" on a UTC bridge
+	// matched from 09:00 UTC. Bind the bounds in the zone rows are written in.
 	if s.After != "" {
 		t, err := time.Parse(time.RFC3339, s.After)
 		if err != nil {
 			return "", fmt.Errorf("invalid after format: %w", err)
 		}
 		where = append(where, "m.timestamp > "+placeholder(len(args)+1))
-		args = append(args, t)
+		args = append(args, t.In(time.Local))
 	}
 
 	if s.Before != "" {
@@ -5320,7 +5324,7 @@ func (store *MessageStore) ListMessages(s ListMessagesParams) (string, error) {
 			return "", fmt.Errorf("invalid before format: %w", err)
 		}
 		where = append(where, "m.timestamp < "+placeholder(len(args)+1))
-		args = append(args, t)
+		args = append(args, t.In(time.Local))
 	}
 
 	if s.SenderPhoneNumber != nil && *s.SenderPhoneNumber != "" {

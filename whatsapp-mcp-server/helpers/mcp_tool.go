@@ -217,7 +217,7 @@ type searchContactsInput struct {
 }
 
 type listMessagesInput struct {
-	After             *string `mcp:"description:ISO-8601 formatted string"`
+	After             *string `json:"After,omitempty" jsonschema:"Optional. Only messages after this time, RFC3339 with offset (e.g. 2026-10-29T09:00:00+08:00)"`
 	Before            *string `json:"before,omitempty" jsonschema:"description:ISO-8601 formatted string"`
 	SenderPhoneNumber *string `json:"sender_phone_number,omitempty"`
 	ChatJid           *string `json:"chat_jid,omitempty"`
@@ -270,7 +270,7 @@ type getLastInteractionInput struct {
 type sendMessageInput struct {
 	Recipient        string  `json:"recipient" jsonschema:"description:Phone number (no +) or group JID like 123@g.us"`
 	Message          string  `json:"message"`
-	ReplyToMessageID *string `json:"reply_to_message_id,omitempty" jsonschema:"description:Optional. Message ID to reply to (quote), as shown in list_messages. Must be a message in the same chat as recipient."`
+	ReplyToMessageID *string `json:"reply_to_message_id,omitempty" jsonschema:"Optional. Message ID to reply to (quote), as shown in list_messages. Must be a message in the same chat as recipient."`
 }
 
 type sendMediaInput struct {
