@@ -3097,6 +3097,15 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 
 		slog.Info("received request to send message", "message", req.Message, "media_path", req.MediaPath)
 
+		// A reply that names only the quoted ID (the MCP send_message tool) gets
+		// its preview and participant from the store. The manager sends all three.
+		if req.QuotedID != "" && (req.QuotedText == "" || req.QuotedParticipant == "") {
+			if err := fillQuote(client, messageStore, &req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+
 		success, message, sentID := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath, req.MediaBase64, req.MediaFilename, req.MediaMimetype, req.MentionedJIDs, req.QuotedID, req.QuotedText, req.QuotedParticipant, req.IsForwarded, req.NoDelay)
 		var reason string
 		if !success {
@@ -5224,14 +5233,23 @@ func (store *MessageStore) FormatMessage(msg MessageInteraction, showChatInfo bo
 		sb.WriteString(fmt.Sprintf("[%s] ", ts))
 	}
 
-	prefix := ""
+	// Every line carries its message ID and chat JID so a caller can reply to,
+	// react to or download that exact message. Media lines keep their original
+	// "[type - Message ID: … - Chat JID: …]" shape; text lines get the same
+	// bracket without the type.
+	prefix := fmt.Sprintf("[Message ID: %s - Chat JID: %s] ", msg.ID, msg.ChatJID)
 	if msg.MediaType != "" {
 		prefix = fmt.Sprintf("[%s - Message ID: %s - Chat JID: %s] ", msg.MediaType, msg.ID, msg.ChatJID)
 	}
 
+	// The sender's number (or LID user when unmapped) follows the display name,
+	// since a name alone can't address anyone in a group.
 	senderName := "Me"
 	if !msg.IsFromMe {
 		senderName = store.GetSenderName(msg.Sender)
+		if user := senderUser(msg.Sender); user != "" && user != senderName {
+			senderName = fmt.Sprintf("%s (%s)", senderName, user)
+		}
 	}
 
 	sb.WriteString(fmt.Sprintf("From: %s: %s%s\n", senderName, prefix, msg.Content))
@@ -5243,6 +5261,18 @@ func (store *MessageStore) FormatMessage(msg MessageInteraction, showChatInfo bo
 	}
 
 	return sb.String()
+}
+
+// senderUser reduces a stored sender ("60123456789", "60123456789@s.whatsapp.net"
+// or "60123456789:12@s.whatsapp.net") to its bare user part.
+func senderUser(sender string) string {
+	if idx := strings.Index(sender, "@"); idx >= 0 {
+		sender = sender[:idx]
+	}
+	if idx := strings.Index(sender, ":"); idx >= 0 {
+		sender = sender[:idx]
+	}
+	return sender
 }
 
 func (store *MessageStore) FormatMessagesList(messages []MessageInteraction, showChatInfo bool) string {
@@ -5378,6 +5408,93 @@ func (store *MessageStore) ListMessages(s ListMessagesParams) (string, error) {
 	}
 
 	return store.FormatMessagesList(msgs, true), nil
+}
+
+// quoteSource is what a reply needs from the message it quotes.
+type quoteSource struct {
+	ChatJID   string
+	Sender    string
+	Content   string
+	MediaType string
+	IsFromMe  bool
+}
+
+// GetQuoteSource loads a stored message by ID so a reply can be built from the
+// ID alone. An empty chatJID matches the newest message with that ID.
+func (store *MessageStore) GetQuoteSource(messageID, chatJID string) (quoteSource, error) {
+	q := "SELECT chat_jid, sender, content, media_type, is_from_me FROM messages WHERE id = ?"
+	args := []any{messageID}
+	if chatJID != "" {
+		q += " AND chat_jid = ?"
+		args = append(args, chatJID)
+	}
+	q += " ORDER BY timestamp DESC LIMIT 1"
+	if isPostgres {
+		q = strings.Replace(strings.Replace(q, "?", "$1", 1), "?", "$2", 1)
+	}
+
+	var src quoteSource
+	var sender, content, mediaType sql.NullString
+	err := store.db.QueryRow(q, args...).Scan(&src.ChatJID, &sender, &content, &mediaType, &src.IsFromMe)
+	src.Sender, src.Content, src.MediaType = sender.String, content.String, mediaType.String
+	return src, err
+}
+
+// fillQuote completes a reply request that names only the quoted message ID:
+// the preview text comes from the stored message and the participant is the
+// JID it was sent under (own JID for our messages, group LID/phone resolved
+// the same way reactions are, the contact for 1:1 chats).
+func fillQuote(client *whatsmeow.Client, store *MessageStore, req *SendMessageRequest) error {
+	chatJID := ""
+	if strings.Contains(req.Recipient, "@") {
+		if jid, err := types.ParseJID(req.Recipient); err == nil {
+			chatJID = normalizeUserJID(client, jid).String()
+		}
+	} else {
+		digits := strings.Map(func(r rune) rune {
+			if r >= '0' && r <= '9' {
+				return r
+			}
+			return -1
+		}, req.Recipient)
+		chatJID = digits + "@" + types.DefaultUserServer
+	}
+
+	src, err := store.GetQuoteSource(req.QuotedID, chatJID)
+	if err != nil {
+		return fmt.Errorf("message %s not found in this chat", req.QuotedID)
+	}
+
+	if req.QuotedText == "" {
+		req.QuotedText = src.Content
+		if req.QuotedText == "" && src.MediaType != "" {
+			req.QuotedText = "[" + src.MediaType + "]"
+		}
+	}
+
+	if req.QuotedParticipant == "" {
+		switch {
+		case src.IsFromMe && client.Store.ID != nil:
+			req.QuotedParticipant = client.Store.ID.ToNonAD().String()
+		case src.Sender != "":
+			sender := src.Sender
+			if !strings.Contains(sender, "@") {
+				sender += "@" + types.DefaultUserServer
+			}
+			sjid, perr := types.ParseJID(sender)
+			if perr != nil {
+				return fmt.Errorf("stored sender %q of message %s is not a JID", src.Sender, req.QuotedID)
+			}
+			sjid = sjid.ToNonAD()
+			if gjid, gerr := types.ParseJID(src.ChatJID); gerr == nil && gjid.Server == types.GroupServer {
+				sjid = reactionParticipant(client, gjid, req.QuotedID, sjid)
+			}
+			req.QuotedParticipant = sjid.String()
+		default:
+			req.QuotedParticipant = src.ChatJID
+		}
+	}
+	return nil
 }
 
 func (store *MessageStore) GetMessageContext(messageID string, before, after int) (MessageContext, error) {

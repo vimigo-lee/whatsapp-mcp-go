@@ -61,7 +61,7 @@ func InitMcpTool() {
 
 	mcp.AddTool[listMessagesInput, any](server, &mcp.Tool{
 		Name:        "list_messages",
-		Description: "Get WhatsApp messages matching specified criteria with optional context around matches.",
+		Description: "Get WhatsApp messages matching specified criteria with optional context around matches. Each line shows the message ID and chat JID (use them with send_message reply_to_message_id or download_media) and the sender's number after their name.",
 	}, listMessagesHandler)
 
 	mcp.AddTool[getMessageContextInput, any](server, &mcp.Tool{
@@ -101,7 +101,7 @@ func InitMcpTool() {
 
 	mcp.AddTool[sendMessageInput, map[string]any](server, &mcp.Tool{
 		Name:        "send_message",
-		Description: "Send a TEXT message to a person or group on WhatsApp. For groups use the group JID. Text only — to send an image, video, document or any file use send_media instead (and upload_media first if the file is local), not this tool.",
+		Description: "Send a TEXT message to a person or group on WhatsApp. For groups use the group JID. To reply to (quote) a specific message, pass its ID from list_messages as reply_to_message_id. Text only — to send an image, video, document or any file use send_media instead (and upload_media first if the file is local), not this tool.",
 	}, sendMessageHandler)
 
 	mcp.AddTool[sendMediaInput, map[string]any](server, &mcp.Tool{
@@ -268,8 +268,9 @@ type getLastInteractionInput struct {
 }
 
 type sendMessageInput struct {
-	Recipient string `json:"recipient" jsonschema:"description:Phone number (no +) or group JID like 123@g.us"`
-	Message   string `json:"message"`
+	Recipient        string  `json:"recipient" jsonschema:"description:Phone number (no +) or group JID like 123@g.us"`
+	Message          string  `json:"message"`
+	ReplyToMessageID *string `json:"reply_to_message_id,omitempty" jsonschema:"description:Optional. Message ID to reply to (quote), as shown in list_messages. Must be a message in the same chat as recipient."`
 }
 
 type sendMediaInput struct {
@@ -404,6 +405,10 @@ func sendMessageHandler(
 		"recipient": in.Recipient,
 		"message":   in.Message,
 		"no_delay":  true,
+	}
+	// The bridge fills the quote preview and original sender from its store.
+	if in.ReplyToMessageID != nil && *in.ReplyToMessageID != "" {
+		payload["quoted_id"] = *in.ReplyToMessageID
 	}
 
 	data, err := callAPI(http.MethodPost, "/send", payload)
