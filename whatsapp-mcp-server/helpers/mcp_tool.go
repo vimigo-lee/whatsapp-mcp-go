@@ -61,7 +61,7 @@ func InitMcpTool() {
 
 	mcp.AddTool[listMessagesInput, any](server, &mcp.Tool{
 		Name:        "list_messages",
-		Description: "Get WhatsApp messages matching specified criteria with optional context around matches. Each line shows the message ID and chat JID (use them with send_message reply_to_message_id or download_media) and the sender's number after their name.",
+		Description: "Get WhatsApp messages matching specified criteria with optional context around matches. Each line shows the message ID and chat JID (use them with send_message reply_to_message_id or download_media) and the sender's number after their name. A reply is followed by a \"⤷ replying to\" line naming the quoted message's author, ID and a preview, so you can tell which earlier message it answers.",
 	}, listMessagesHandler)
 
 	mcp.AddTool[getMessageContextInput, any](server, &mcp.Tool{

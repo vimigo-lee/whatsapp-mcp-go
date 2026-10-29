@@ -73,6 +73,16 @@ type MessageInteraction struct {
 	ID        string    `json:"id"`
 	ChatName  string    `json:"chat_name,omitempty"`
 	MediaType string    `json:"media_type,omitempty"`
+	// Set when the message is a reply: the quoted message's ID, its author
+	// JID, and the short preview stored when the reply arrived.
+	QuotedMessageID string `json:"quoted_message_id,omitempty"`
+	QuotedSender    string `json:"quoted_sender,omitempty"`
+	QuotedContent   string `json:"quoted_content,omitempty"`
+}
+
+// setQuote fills the reply fields from a row's nullable quoted_* columns.
+func (m *MessageInteraction) setQuote(id, sender, content sql.NullString) {
+	m.QuotedMessageID, m.QuotedSender, m.QuotedContent = id.String, sender.String, content.String
 }
 
 type Chat struct {
@@ -5254,6 +5264,12 @@ func (store *MessageStore) FormatMessage(msg MessageInteraction, showChatInfo bo
 
 	sb.WriteString(fmt.Sprintf("From: %s: %s%s\n", senderName, prefix, msg.Content))
 
+	// A reply names the message it quotes, so a bare "received" can be tied to
+	// the exact card it answers.
+	if msg.QuotedMessageID != "" {
+		sb.WriteString(store.formatQuoteLine(msg))
+	}
+
 	// Reactions on their own indented sub-line so they're clearly distinct from
 	// the message text (which may itself be long or contain brackets/pipes).
 	if rx := store.GetReactions(msg.ID); len(rx) > 0 {
@@ -5262,6 +5278,28 @@ func (store *MessageStore) FormatMessage(msg MessageInteraction, showChatInfo bo
 
 	return sb.String()
 }
+
+// formatQuoteLine renders the "replying to" sub-line: who wrote the quoted
+// message, its ID (for get_message_context / reply_to_message_id) and a
+// one-line preview.
+func (store *MessageStore) formatQuoteLine(msg MessageInteraction) string {
+	who := "unknown"
+	if msg.QuotedSender != "" {
+		who = store.GetSenderName(msg.QuotedSender)
+		if user := senderUser(msg.QuotedSender); user != "" && user != who {
+			who = fmt.Sprintf("%s (%s)", who, user)
+		}
+	}
+	preview := strings.Join(strings.Fields(msg.QuotedContent), " ")
+	if r := []rune(preview); len(r) > quotePreviewMaxRunes {
+		preview = string(r[:quotePreviewMaxRunes]) + "…"
+	}
+	return fmt.Sprintf("    ⤷ replying to %s [Message ID: %s]: %s\n", who, msg.QuotedMessageID, preview)
+}
+
+// quotePreviewMaxRunes caps the quoted preview so a long card doesn't swamp
+// the reply line; the full text is one get_message_context call away.
+const quotePreviewMaxRunes = 300
 
 // senderUser reduces a stored sender ("60123456789", "60123456789@s.whatsapp.net"
 // or "60123456789:12@s.whatsapp.net") to its bare user part.
@@ -5300,7 +5338,8 @@ func (store *MessageStore) ListMessages(s ListMessagesParams) (string, error) {
 	q := `
         SELECT 
             m.timestamp, m.sender, c.name, m.content, m.is_from_me, 
-            c.jid, m.id, m.media_type
+            c.jid, m.id, m.media_type,
+            m.quoted_message_id, m.quoted_sender, m.quoted_content
         FROM messages m
         JOIN chats c ON m.chat_jid = c.jid
     `
@@ -5370,9 +5409,10 @@ func (store *MessageStore) ListMessages(s ListMessagesParams) (string, error) {
 			cJid      string
 			id        string
 			mediaType sql.NullString
+			qID, qSender, qContent sql.NullString
 		)
 
-		if err := rows.Scan(&ts, &sender, &chatName, &content, &isFromMe, &cJid, &id, &mediaType); err != nil {
+		if err := rows.Scan(&ts, &sender, &chatName, &content, &isFromMe, &cJid, &id, &mediaType, &qID, &qSender, &qContent); err != nil {
 			log.Printf("scan error: %v", err)
 			continue
 		}
@@ -5392,6 +5432,7 @@ func (store *MessageStore) ListMessages(s ListMessagesParams) (string, error) {
 		if mediaType.Valid {
 			m.MediaType = mediaType.String
 		}
+		m.setQuote(qID, qSender, qContent)
 
 		msgs = append(msgs, m)
 	}
@@ -5512,7 +5553,8 @@ func (store *MessageStore) GetMessageContext(messageID string, before, after int
 	// --- Fetch the target message ---
 	q := `
         SELECT m.timestamp, m.sender, c.name, m.content, m.is_from_me,
-               c.jid, m.id, m.media_type, m.chat_jid
+               c.jid, m.id, m.media_type, m.chat_jid,
+               m.quoted_message_id, m.quoted_sender, m.quoted_content
         FROM messages m
         JOIN chats c ON m.chat_jid = c.jid
         WHERE m.id = ` + placeholder(1)
@@ -5527,10 +5569,11 @@ func (store *MessageStore) GetMessageContext(messageID string, before, after int
 		id       string
 		media    sql.NullString
 		chatJid2 string
+		qID, qSender, qContent sql.NullString
 	)
 
 	row := store.db.QueryRow(q, messageID)
-	if err := row.Scan(&ts, &sender, &chatName, &content, &isFromMe, &chatJid, &id, &media, &chatJid2); err != nil {
+	if err := row.Scan(&ts, &sender, &chatName, &content, &isFromMe, &chatJid, &id, &media, &chatJid2, &qID, &qSender, &qContent); err != nil {
 		if err == sql.ErrNoRows {
 			return MessageContext{}, fmt.Errorf("message not found: %s", messageID)
 		}
@@ -5551,10 +5594,12 @@ func (store *MessageStore) GetMessageContext(messageID string, before, after int
 	if media.Valid {
 		target.MediaType = media.String
 	}
+	target.setQuote(qID, qSender, qContent)
 
 	qBefore := `
         SELECT m.timestamp, m.sender, c.name, m.content, m.is_from_me,
-               c.jid, m.id, m.media_type
+               c.jid, m.id, m.media_type,
+               m.quoted_message_id, m.quoted_sender, m.quoted_content
         FROM messages m
         JOIN chats c ON m.chat_jid = c.jid
         WHERE m.chat_jid = ` + placeholder(1) + `
@@ -5579,9 +5624,10 @@ func (store *MessageStore) GetMessageContext(messageID string, before, after int
 			bjid     string
 			bid      string
 			bmedia   sql.NullString
+			bqID, bqSender, bqContent sql.NullString
 		)
 
-		if err := bRows.Scan(&bts, &bsender, &bname, &bcontent, &bif, &bjid, &bid, &bmedia); err != nil {
+		if err := bRows.Scan(&bts, &bsender, &bname, &bcontent, &bif, &bjid, &bid, &bmedia, &bqID, &bqSender, &bqContent); err != nil {
 			continue
 		}
 
@@ -5599,12 +5645,14 @@ func (store *MessageStore) GetMessageContext(messageID string, before, after int
 		if bmedia.Valid {
 			m.MediaType = bmedia.String
 		}
+		m.setQuote(bqID, bqSender, bqContent)
 		beforeMsgs = append(beforeMsgs, m)
 	}
 
 	qAfter := `
         SELECT m.timestamp, m.sender, c.name, m.content, m.is_from_me,
-               c.jid, m.id, m.media_type
+               c.jid, m.id, m.media_type,
+               m.quoted_message_id, m.quoted_sender, m.quoted_content
         FROM messages m
         JOIN chats c ON m.chat_jid = c.jid
         WHERE m.chat_jid = ` + placeholder(1) + `
@@ -5629,9 +5677,10 @@ func (store *MessageStore) GetMessageContext(messageID string, before, after int
 			ajid     string
 			aid      string
 			amedia   sql.NullString
+			aqID, aqSender, aqContent sql.NullString
 		)
 
-		if err := aRows.Scan(&ats, &asender, &aname, &acontent, &aif, &ajid, &aid, &amedia); err != nil {
+		if err := aRows.Scan(&ats, &asender, &aname, &acontent, &aif, &ajid, &aid, &amedia, &aqID, &aqSender, &aqContent); err != nil {
 			continue
 		}
 
@@ -5649,6 +5698,7 @@ func (store *MessageStore) GetMessageContext(messageID string, before, after int
 		if amedia.Valid {
 			m.MediaType = amedia.String
 		}
+		m.setQuote(aqID, aqSender, aqContent)
 		afterMsgs = append(afterMsgs, m)
 	}
 
@@ -5958,7 +6008,8 @@ func (store *MessageStore) GetLastInteraction(jid string) (string, error) {
 	q := `
         SELECT 
             m.timestamp, m.sender, c.name, m.content, m.is_from_me,
-            c.jid, m.id, m.media_type
+            c.jid, m.id, m.media_type,
+            m.quoted_message_id, m.quoted_sender, m.quoted_content
         FROM messages m
         JOIN chats c ON m.chat_jid = c.jid
         WHERE m.sender = ` + placeholder(1) + `
@@ -5978,9 +6029,10 @@ func (store *MessageStore) GetLastInteraction(jid string) (string, error) {
 		chatJid   string
 		id        string
 		mediaType sql.NullString
+		qID, qSender, qContent sql.NullString
 	)
 
-	if err := row.Scan(&ts, &sender, &chatName, &content, &isFromMe, &chatJid, &id, &mediaType); err != nil {
+	if err := row.Scan(&ts, &sender, &chatName, &content, &isFromMe, &chatJid, &id, &mediaType, &qID, &qSender, &qContent); err != nil {
 		if err == sql.ErrNoRows {
 			return "", nil
 		}
@@ -6002,6 +6054,7 @@ func (store *MessageStore) GetLastInteraction(jid string) (string, error) {
 	if mediaType.Valid {
 		msg.MediaType = mediaType.String
 	}
+	msg.setQuote(qID, qSender, qContent)
 
 	return store.FormatMessage(msg, true), nil
 }
