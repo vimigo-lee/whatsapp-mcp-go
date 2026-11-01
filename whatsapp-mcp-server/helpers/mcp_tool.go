@@ -101,8 +101,13 @@ func InitMcpTool() {
 
 	mcp.AddTool[sendMessageInput, map[string]any](server, &mcp.Tool{
 		Name:        "send_message",
-		Description: "Send a TEXT message to a person or group on WhatsApp. For groups use the group JID. To reply to (quote) a specific message, pass its ID from list_messages as reply_to_message_id. Text only — to send an image, video, document or any file use send_media instead (and upload_media first if the file is local), not this tool.",
+		Description: "Send a TEXT message to a person or group on WhatsApp. For groups use the group JID. To reply to (quote) a specific message, pass its ID from list_messages as reply_to_message_id. Text only — to send an image, video, document or any file use send_media instead (and upload_media first if the file is local), and to share a contact card use send_contact, not this tool.",
 	}, sendMessageHandler)
+
+	mcp.AddTool[sendContactInput, map[string]any](server, &mcp.Tool{
+		Name:        "send_contact",
+		Description: "Share a contact card (vCard) with a person or group on WhatsApp. The recipient sees the name with a Message button that opens a chat with that number. Use this instead of typing a phone number into send_message when someone asks for a contact.",
+	}, sendContactHandler)
 
 	mcp.AddTool[sendMediaInput, map[string]any](server, &mcp.Tool{
 		Name:        "send_media",
@@ -273,6 +278,13 @@ type sendMessageInput struct {
 	ReplyToMessageID *string `json:"reply_to_message_id,omitempty" jsonschema:"Optional. Message ID to reply to (quote), as shown in list_messages. Must be a message in the same chat as recipient."`
 }
 
+type sendContactInput struct {
+	Recipient        string   `json:"recipient" jsonschema:"Phone number (no +) or group JID like 123@g.us to send the card to"`
+	Name             string   `json:"name" jsonschema:"Contact name shown on the card"`
+	Phones           []string `json:"phones" jsonschema:"The contact's phone numbers with country code, e.g. [\"60123456789\"]"`
+	ReplyToMessageID *string  `json:"reply_to_message_id,omitempty" jsonschema:"Optional. Message ID to reply to (quote), as shown in list_messages. Must be a message in the same chat as recipient."`
+}
+
 type sendMediaInput struct {
 	Recipient string  `json:"recipient" jsonschema:"description:Phone number (no +) or group JID like 123@g.us"`
 	URL       *string `json:"url,omitempty" jsonschema:"description:Public http(s) URL of the media; the server downloads it. Provide exactly one of url/base64/media_path."`
@@ -437,6 +449,45 @@ func sendMessageHandler(
 			}, nil
 	}
 
+	return &mcp.CallToolResult{}, resp, nil
+}
+
+func sendContactHandler(
+	ctx context.Context,
+	req *mcp.CallToolRequest,
+	in sendContactInput,
+) (*mcp.CallToolResult, map[string]any, error) {
+	fail := func(msg string) (*mcp.CallToolResult, map[string]any, error) {
+		return &mcp.CallToolResult{
+				IsError: true,
+				Content: []mcp.Content{&mcp.TextContent{Text: msg}},
+			}, map[string]any{
+				"success": false,
+				"error":   msg,
+			}, nil
+	}
+	if in.Recipient == "" || in.Name == "" || len(in.Phones) == 0 {
+		return fail("recipient, name and phones are required")
+	}
+
+	payload := map[string]any{
+		"recipient": in.Recipient,
+		"name":      in.Name,
+		"phones":    in.Phones,
+		"no_delay":  true,
+	}
+	if in.ReplyToMessageID != nil && *in.ReplyToMessageID != "" {
+		payload["quoted_id"] = *in.ReplyToMessageID
+	}
+
+	data, err := callAPI(http.MethodPost, "/send-contact", payload)
+	if err != nil {
+		return fail(err.Error())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return fail("failed to parse API response")
+	}
 	return &mcp.CallToolResult{}, resp, nil
 }
 

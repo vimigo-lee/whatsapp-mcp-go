@@ -30,3 +30,22 @@ func TestListMessagesSchemaAfterOptional(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestSendContactSchema(t *testing.T) {
+	s, err := jsonschema.For[sendContactInput](nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	required := map[string]bool{}
+	for _, r := range s.Required {
+		required[r] = true
+	}
+	for _, r := range []string{"recipient", "name", "phones"} {
+		if !required[r] {
+			t.Fatalf("%s must be required, required=%v", r, s.Required)
+		}
+	}
+	if required["reply_to_message_id"] {
+		t.Fatalf("reply_to_message_id must be optional, required=%v", s.Required)
+	}
+}

@@ -1295,6 +1295,17 @@ type SendMessageRequest struct {
 	NoDelay bool `json:"no_delay,omitempty"`
 }
 
+// SendContactRequest shares a contact card. Phones are numbers with country
+// code (a leading + and spaces are fine); each becomes a TEL line whose waid
+// gives the card its "Message" button on the recipient's phone.
+type SendContactRequest struct {
+	Recipient string   `json:"recipient"`
+	Name      string   `json:"name"`
+	Phones    []string `json:"phones"`
+	QuotedID  string   `json:"quoted_id,omitempty"`
+	NoDelay   bool     `json:"no_delay,omitempty"`
+}
+
 var clientVersionRegex = regexp.MustCompile(`"client_revision":(\d+),`)
 
 func CustomGetLatestVersion(ctx context.Context, httpClient *http.Client) (*store.WAVersionContainer, error) {
@@ -1717,6 +1728,91 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient), sendResp.ID
+}
+
+// vcardEscape escapes a vCard 3.0 text value.
+func vcardEscape(s string) string {
+	return strings.NewReplacer(`\`, `\\`, ",", `\,`, ";", `\;`, "\r\n", `\n`, "\n", `\n`).Replace(s)
+}
+
+// buildContactVCard renders the vCard WhatsApp expects in a ContactMessage.
+// phones must already be bare digits with country code.
+func buildContactVCard(name string, phones []string) string {
+	var b strings.Builder
+	b.WriteString("BEGIN:VCARD\nVERSION:3.0\n")
+	b.WriteString("N:;" + vcardEscape(name) + ";;;\n")
+	b.WriteString("FN:" + vcardEscape(name) + "\n")
+	for _, p := range phones {
+		b.WriteString("TEL;type=CELL;type=VOICE;waid=" + p + ":+" + p + "\n")
+	}
+	b.WriteString("END:VCARD")
+	return b.String()
+}
+
+// sendContactMessage sends one contact card. Mirrors sendWhatsAppMessage's
+// recipient resolution, pacing and own-store persistence.
+func sendContactMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient, name string, phones []string, quotedID, quotedText, quotedParticipant string, noDelay bool) (bool, string, string) {
+	if !client.IsConnected() {
+		return false, "Not connected to WhatsApp", ""
+	}
+
+	var recipientJID types.JID
+	if strings.Contains(recipient, "@") {
+		jid, err := types.ParseJID(recipient)
+		if err != nil {
+			return false, fmt.Sprintf("Error parsing JID: %v", err), ""
+		}
+		recipientJID = jid
+	} else {
+		recipientJID = types.JID{User: recipient, Server: types.DefaultUserServer}
+	}
+	recipientJID = normalizeUserJID(client, recipientJID)
+
+	card := &waE2E.ContactMessage{
+		DisplayName: proto.String(name),
+		Vcard:       proto.String(buildContactVCard(name, phones)),
+	}
+	if quotedID != "" {
+		card.ContextInfo = &waE2E.ContextInfo{
+			StanzaID:      proto.String(quotedID),
+			QuotedMessage: &waE2E.Message{Conversation: proto.String(quotedText)},
+		}
+		if quotedParticipant != "" {
+			card.ContextInfo.Participant = proto.String(quotedParticipant)
+		}
+	}
+
+	if !noDelay {
+		holdWithTyping(client, recipientJID, humanSendDelay())
+	}
+
+	sendResp, err := client.SendMessage(context.Background(), recipientJID, &waE2E.Message{ContactMessage: card})
+	if err != nil {
+		return false, fmt.Sprintf("Error sending message: %v", err), ""
+	}
+	presence.active(client)
+
+	// Same reason as sendWhatsAppMessage: WhatsApp never echoes our own send.
+	if messageStore != nil && client.Store.ID != nil {
+		sender := client.Store.ID.ToNonAD().String()
+		chatJID := recipientJID.String()
+		sentAt := time.Now()
+		if storeErr := messageStore.StoreChat(
+			chatJID, GetChatName(client, messageStore, recipientJID, chatJID, nil, sender, waLog.Noop), sentAt,
+		); storeErr != nil {
+			slog.Warn("failed to store chat for sent contact", "error", storeErr)
+		}
+		content := "[contact] " + name + " (+" + strings.Join(phones, ", +") + ")"
+		if storeErr := messageStore.StoreMessage(
+			sendResp.ID, chatJID, sender, content, sentAt, true,
+			"", "", "", "", nil, nil, nil, 0,
+			quotedID, quotedParticipant, quotedText, false,
+		); storeErr != nil {
+			slog.Warn("failed to store sent contact", "error", storeErr)
+		}
+	}
+
+	return true, fmt.Sprintf("Contact sent to %s", recipient), sendResp.ID
 }
 
 // Extract media info from a message
@@ -3135,6 +3231,67 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 			w.WriteHeader(http.StatusInternalServerError)
 		}
 
+		json.NewEncoder(w).Encode(SendMessageResponse{
+			Success:   success,
+			Message:   message,
+			MessageID: sentID,
+			Reason:    reason,
+		})
+	})
+
+	apiMux.HandleFunc("/send-contact", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req SendContactRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		req.Name = strings.TrimSpace(req.Name)
+		if req.Recipient == "" || req.Name == "" || len(req.Phones) == 0 {
+			http.Error(w, "recipient, name and phones are required", http.StatusBadRequest)
+			return
+		}
+		phones := make([]string, 0, len(req.Phones))
+		for _, p := range req.Phones {
+			digits := strings.Map(func(r rune) rune {
+				if r >= '0' && r <= '9' {
+					return r
+				}
+				return -1
+			}, p)
+			if len(digits) < 7 {
+				http.Error(w, fmt.Sprintf("phone %q is not a full number with country code", p), http.StatusBadRequest)
+				return
+			}
+			phones = append(phones, digits)
+		}
+
+		// Reuse the /send quote lookup so a bare quoted_id gets its preview and sender.
+		quote := SendMessageRequest{Recipient: req.Recipient, QuotedID: req.QuotedID}
+		if req.QuotedID != "" {
+			if err := fillQuote(client, messageStore, &quote); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+
+		success, message, sentID := sendContactMessage(client, messageStore, req.Recipient, req.Name, phones, quote.QuotedID, quote.QuotedText, quote.QuotedParticipant, req.NoDelay)
+		var reason string
+		if !success {
+			if r, friendly := classifySendError(message); r != "" {
+				reason = r
+				message = friendly
+			}
+		}
+		slog.Info("contact sent", "success", success, "message", message, "message_id", sentID, "reason", reason)
+		w.Header().Set("Content-Type", "application/json")
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
 		json.NewEncoder(w).Encode(SendMessageResponse{
 			Success:   success,
 			Message:   message,
