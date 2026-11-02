@@ -1768,9 +1768,10 @@ func sendContactMessage(client *whatsmeow.Client, messageStore *MessageStore, re
 	}
 	recipientJID = normalizeUserJID(client, recipientJID)
 
+	vcard := buildContactVCard(name, phones)
 	card := &waE2E.ContactMessage{
 		DisplayName: proto.String(name),
-		Vcard:       proto.String(buildContactVCard(name, phones)),
+		Vcard:       proto.String(vcard),
 	}
 	if quotedID != "" {
 		card.ContextInfo = &waE2E.ContextInfo{
@@ -1802,9 +1803,9 @@ func sendContactMessage(client *whatsmeow.Client, messageStore *MessageStore, re
 		); storeErr != nil {
 			slog.Warn("failed to store chat for sent contact", "error", storeErr)
 		}
-		content := "[contact] " + name + " (+" + strings.Join(phones, ", +") + ")"
+		// Stored as the vCard, like a received card, so the manager renders it.
 		if storeErr := messageStore.StoreMessage(
-			sendResp.ID, chatJID, sender, content, sentAt, true,
+			sendResp.ID, chatJID, sender, vcard, sentAt, true,
 			"", "", "", "", nil, nil, nil, 0,
 			quotedID, quotedParticipant, quotedText, false,
 		); storeErr != nil {
@@ -1958,6 +1959,82 @@ func describeMessage(m *waE2E.Message) string {
 		return "[poll vote]"
 	}
 	return ""
+}
+
+// contactCardContent returns the vCard of a shared contact so the card is
+// stored whole — the manager renders it (name, number, Message button) instead
+// of a bare "[contact]". A multi-contact share is stored as its vCards one
+// after another. Returns "" for any other message, and for a card that carries
+// no vCard, so the caller can fall back to describeMessage.
+func contactCardContent(m *waE2E.Message) string {
+	if m == nil {
+		return ""
+	}
+	if c := m.GetContactMessage(); c != nil {
+		return strings.TrimSpace(c.GetVcard())
+	}
+	if a := m.GetContactsArrayMessage(); a != nil {
+		var cards []string
+		for _, c := range a.GetContacts() {
+			if v := strings.TrimSpace(c.GetVcard()); v != "" {
+				cards = append(cards, v)
+			}
+		}
+		return strings.Join(cards, "\n")
+	}
+	return ""
+}
+
+var (
+	// An optional "item1." group prefix is how iOS writes TEL/FN lines.
+	vcardFNRe   = regexp.MustCompile(`(?im)^(?:[\w-]+\.)?FN[^:\r\n]*:(.*)$`)
+	vcardTELRe  = regexp.MustCompile(`(?im)^(?:[\w-]+\.)?TEL([^:\r\n]*):(.*)$`)
+	vcardWaidRe = regexp.MustCompile(`(?i)waid=(\d+)`)
+	vcardEndRe  = regexp.MustCompile(`(?i)END:VCARD`)
+)
+
+// vcardUnescape reverses vcardEscape for display.
+func vcardUnescape(s string) string {
+	return strings.NewReplacer(`\\`, `\`, `\,`, ",", `\;`, ";", `\n`, " ", `\N`, " ").Replace(s)
+}
+
+// contactCardSummary renders stored vCard content as one readable line per
+// card — "[contact] Name (+60123456789)", the shape send_contact used to store —
+// for list_messages and reply quotes, which would otherwise carry the raw
+// multi-line vCard. Anything that is not a vCard is returned unchanged.
+func contactCardSummary(content string) string {
+	if !strings.HasPrefix(strings.ToUpper(strings.TrimSpace(content)), "BEGIN:VCARD") {
+		return content
+	}
+	var out []string
+	for _, card := range vcardEndRe.Split(content, -1) {
+		if strings.TrimSpace(card) == "" {
+			continue
+		}
+		name := ""
+		if fn := vcardFNRe.FindStringSubmatch(card); fn != nil {
+			name = vcardUnescape(strings.TrimSpace(fn[1]))
+		}
+		var phones []string
+		for _, tel := range vcardTELRe.FindAllStringSubmatch(card, -1) {
+			// waid is the WhatsApp number; the value is whatever the sender's
+			// address book holds ("+60 12-345 6789", sometimes a local form).
+			if w := vcardWaidRe.FindStringSubmatch(tel[1]); w != nil {
+				phones = append(phones, "+"+w[1])
+			} else if v := strings.TrimSpace(tel[2]); v != "" {
+				phones = append(phones, v)
+			}
+		}
+		line := "[contact]"
+		if name != "" {
+			line += " " + name
+		}
+		if len(phones) > 0 {
+			line += " (" + strings.Join(phones, ", ") + ")"
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, " ")
 }
 
 // contextInfoOf returns the ContextInfo attached to whichever message variant
@@ -2353,9 +2430,13 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	}
 
 	if content == "" && mediaType == "" {
-		// Identify non-text / non-basic-media messages (location, contact, poll)
-		// so they're stored and visible in the MCP instead of being dropped.
-		content = describeMessage(unwrapMessage(msg.Message))
+		// A shared contact keeps its vCard; other non-text / non-basic-media
+		// messages (location, poll) get a label so they're stored and visible
+		// in the MCP instead of being dropped.
+		content = contactCardContent(unwrapMessage(msg.Message))
+		if content == "" {
+			content = describeMessage(unwrapMessage(msg.Message))
+		}
 	}
 
 	if content == "" && mediaType == "" {
@@ -4781,6 +4862,10 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					directPath = mediaDirectPath(msg.Message.Message)
 				}
 
+				if content == "" && mediaType == "" {
+					content = contactCardContent(unwrapMessage(msg.Message.Message))
+				}
+
 				logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
 
 				if content == "" && mediaType == "" {
@@ -5419,7 +5504,7 @@ func (store *MessageStore) FormatMessage(msg MessageInteraction, showChatInfo bo
 		}
 	}
 
-	sb.WriteString(fmt.Sprintf("From: %s: %s%s\n", senderName, prefix, msg.Content))
+	sb.WriteString(fmt.Sprintf("From: %s: %s%s\n", senderName, prefix, contactCardSummary(msg.Content)))
 
 	// A reply names the message it quotes, so a bare "received" can be tied to
 	// the exact card it answers.
@@ -5447,7 +5532,7 @@ func (store *MessageStore) formatQuoteLine(msg MessageInteraction) string {
 			who = fmt.Sprintf("%s (%s)", who, user)
 		}
 	}
-	preview := strings.Join(strings.Fields(msg.QuotedContent), " ")
+	preview := strings.Join(strings.Fields(contactCardSummary(msg.QuotedContent)), " ")
 	if r := []rune(preview); len(r) > quotePreviewMaxRunes {
 		preview = string(r[:quotePreviewMaxRunes]) + "…"
 	}
@@ -5668,7 +5753,7 @@ func fillQuote(client *whatsmeow.Client, store *MessageStore, req *SendMessageRe
 	}
 
 	if req.QuotedText == "" {
-		req.QuotedText = src.Content
+		req.QuotedText = contactCardSummary(src.Content)
 		if req.QuotedText == "" && src.MediaType != "" {
 			req.QuotedText = "[" + src.MediaType + "]"
 		}
