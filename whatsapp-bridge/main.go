@@ -2549,10 +2549,8 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// message behind it, so the manager's chat list showed a newer date than
 	// the newest bubble in the conversation.
 
-	// MSG-DEBUG (temporary): dump every message's raw protobuf + info to diagnose
-	// how edits are delivered. Remove after diagnosis.
-	if b, mErr := protojson.Marshal(msg.Message); mErr == nil {
-		logger.Infof("MSG-DEBUG id=%s chat=%s type=%s cat=%s raw=%s", msg.Info.ID, chatJID, msg.Info.Type, msg.Info.Category, string(b))
+	if debugRawMessages {
+		logger.Infof("MSG-DEBUG id=%s chat=%s type=%s cat=%s raw=%s", msg.Info.ID, chatJID, msg.Info.Type, msg.Info.Category, redactedMessageJSON(msg.Message))
 	}
 
 	// Modern clients deliver OTHER parties' message edits (and poll/event edits)
@@ -4837,8 +4835,19 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 	serverAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	slog.Info("starting REST API server", "addr", serverAddr)
 
+	// Without timeouts a client that sends headers or reads the response one
+	// byte at a time holds a connection (and a goroutine) forever, so a handful
+	// of them can starve the API. WriteTimeout is left unset: /download and
+	// media sends stream large files and run longer than any fixed cap.
+	srv := &http.Server{
+		Addr:              serverAddr,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       5 * time.Minute, // whole body, incl. base64 media uploads
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    64 << 10,
+	}
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		if err := srv.ListenAndServe(); err != nil {
 			slog.Error("rest api server error", "err", err)
 		}
 	}()
