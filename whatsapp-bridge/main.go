@@ -705,6 +705,57 @@ func normalizeUserJID(client *whatsmeow.Client, jid types.JID) types.JID {
 	return pn
 }
 
+// moveLIDChatRows moves everything stored under a contact's @lid chat to their
+// phone-number chat, inside the caller's transaction.
+//
+// The same message is often stored in both chats (history sync under one
+// address, live delivery under the other), and rows are keyed by (id,
+// chat_jid), so a plain UPDATE of chat_jid hits the primary key and the whole
+// merge fails, on every start, leaving the contact split in two. Instead:
+// the copy kept is the phone-number one, but it takes over the @lid copy's
+// revoke and a newer edit, so a deleted or corrected message stays that way;
+// messages only in the @lid chat move; the @lid copies left are duplicates
+// and go. Business labels and reactions follow the chat.
+func moveLIDChatRows(tx *sql.Tx, isPostgresDB bool, lidJID, pnJID string) error {
+	steps := []struct {
+		q    string
+		args []any
+	}{
+		// A revoke on either copy wins.
+		{`UPDATE messages SET deleted_at = (SELECT l.deleted_at FROM messages l WHERE l.chat_jid = ? AND l.id = messages.id)
+			WHERE chat_jid = ? AND deleted_at IS NULL
+			AND id IN (SELECT id FROM messages WHERE chat_jid = ? AND deleted_at IS NOT NULL)`,
+			[]any{lidJID, pnJID, lidJID}},
+		// The later edit wins.
+		{`UPDATE messages SET
+				content = (SELECT l.content FROM messages l WHERE l.chat_jid = ? AND l.id = messages.id),
+				edited_at = (SELECT l.edited_at FROM messages l WHERE l.chat_jid = ? AND l.id = messages.id)
+			WHERE chat_jid = ? AND id IN (
+				SELECT l.id FROM messages l WHERE l.chat_jid = ? AND l.edited_at IS NOT NULL
+				AND (messages.edited_at IS NULL OR l.edited_at > messages.edited_at))`,
+			[]any{lidJID, lidJID, pnJID, lidJID}},
+		{`UPDATE messages SET chat_jid = ? WHERE chat_jid = ? AND id NOT IN (SELECT id FROM messages WHERE chat_jid = ?)`,
+			[]any{pnJID, lidJID, pnJID}},
+		{`DELETE FROM messages WHERE chat_jid = ?`, []any{lidJID}},
+		{`UPDATE reactions SET chat_jid = ? WHERE chat_jid = ?`, []any{pnJID, lidJID}},
+		{`UPDATE wa_chat_labels SET chat_jid = ? WHERE chat_jid = ? AND label_id NOT IN (SELECT label_id FROM wa_chat_labels WHERE chat_jid = ?)`,
+			[]any{pnJID, lidJID, pnJID}},
+		{`DELETE FROM wa_chat_labels WHERE chat_jid = ?`, []any{lidJID}},
+	}
+	for _, s := range steps {
+		q := s.q
+		if isPostgresDB {
+			for n := 1; strings.Contains(q, "?"); n++ {
+				q = strings.Replace(q, "?", "$"+strconv.Itoa(n), 1)
+			}
+		}
+		if _, err := tx.Exec(q, s.args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // migrateLIDChatsToPhoneJIDs merges chats stored under @lid
 // into their corresponding @s.whatsapp.net chats.
 //
@@ -789,13 +840,6 @@ func migrateLIDChatsToPhoneJIDs(
 			continue
 		}
 
-		commit := false
-		defer func() {
-			if !commit {
-				_ = tx.Rollback()
-			}
-		}()
-
 		lidJID, parseErr := types.ParseJID(c.JID)
 		if parseErr != nil {
 			logger.Warnf("LID migration: invalid jid %s: %v", c.JID, parseErr)
@@ -849,23 +893,7 @@ func migrateLIDChatsToPhoneJIDs(
 			continue
 		}
 
-		var moveMessagesQuery string
-
-		if isPostgresDB {
-			moveMessagesQuery = `
-				UPDATE messages
-				SET chat_jid = $1
-				WHERE chat_jid = $2
-			`
-		} else {
-			moveMessagesQuery = `
-				UPDATE messages
-				SET chat_jid = ?
-				WHERE chat_jid = ?
-			`
-		}
-
-		if _, err = tx.Exec(moveMessagesQuery, pnStr, c.JID); err != nil {
+		if err = moveLIDChatRows(tx, isPostgresDB, c.JID, pnStr); err != nil {
 			logger.Warnf("LID migration: move messages failed %s -> %s: %v", c.JID, pnStr, err)
 			_ = tx.Rollback()
 			skipped++
@@ -893,8 +921,6 @@ func migrateLIDChatsToPhoneJIDs(
 			skipped++
 			continue
 		}
-
-		commit = true
 
 		logger.Infof("LID migration: merged %s -> %s", c.JID, pnStr)
 		merged++
