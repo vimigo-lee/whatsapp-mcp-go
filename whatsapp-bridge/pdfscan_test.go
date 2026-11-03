@@ -108,6 +108,22 @@ func TestPDFReasons(t *testing.T) {
 		{"launches a program", buildPDF(
 			"<< /Type /Catalog /Pages 2 0 R /OpenAction << /S /Launch /F (cmd.exe) >> >>", pdfPages, pdfPage,
 		), []string{reasonPDFLaunch}},
+		{"link that opens another pdf is not a launch risk", buildPDF(
+			"<< /Type /Catalog /Pages 2 0 R >>", pdfPages,
+			"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>",
+			"<< /Type /Annot /Subtype /Link /Rect [0 0 50 20] /A << /S /Launch /F << /Type /Filespec /F (../D&B Experience List Jan2026 1.pdf) /UF (../D&B Experience List Jan2026 1.pdf) >> >> >>",
+		), nil},
+		{"launch with windows parameters", buildPDF(
+			"<< /Type /Catalog /Pages 2 0 R /OpenAction << /S /Launch /Win << /F (cmd.exe) /P (/c start calc) >> >> >>", pdfPages, pdfPage,
+		), []string{reasonPDFLaunch}},
+		{"launch passing parameters to a document name", buildPDF(
+			"<< /Type /Catalog /Pages 2 0 R /OpenAction << /S /Launch /Win << /F (report.pdf) /P (/c evil) >> >> >>", pdfPages, pdfPage,
+		), []string{reasonPDFLaunch}},
+		{"launch of a file without extension", buildPDF(
+			"<< /Type /Catalog /Pages 2 0 R /OpenAction << /S /Launch /F (cmd) >> >>", pdfPages, pdfPage,
+		), []string{reasonPDFLaunch}},
+		{"broken file launching a document link", []byte("%PDF-1.4\n1 0 obj << /A << /S /Launch /F << /F (../Brochure.pdf) >> >> >> endobj\n%%EOF"), nil},
+		{"broken file launching a program", []byte("%PDF-1.4\n1 0 obj << /A << /S /Launch /F (calc.exe) >> >> endobj\n%%EOF"), []string{reasonPDFLaunch}},
 		{"disguised keyword", buildPDF(
 			"<< /Type /Catalog /Pages 2 0 R /OpenAction 4 0 R >>", pdfPages, pdfPage,
 			"<< /S /J#61vaScript /JS (app.alert(1);) >>",

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -146,7 +147,7 @@ func pdfObjectReasons(ctx *model.Context) []string {
 		}
 		switch v := o.(type) {
 		case types.Dict:
-			if pdfName(v["S"]) == "Launch" {
+			if pdfName(v["S"]) == "Launch" && pdfLaunchCanRun(v, deref) {
 				launch = true
 			}
 			if aa, ok := deref(v["AA"]).(types.Dict); ok {
@@ -206,6 +207,55 @@ func pdfObjectReasons(ctx *model.Context) []string {
 	return reasons
 }
 
+// pdfDocumentExtensions are launch targets that only open another document.
+// Office and PDF exports write these for "link to file" (e.g. a company
+// profile linking ../Brochure.pdf); they can't run anything.
+var pdfDocumentExtensions = map[string]bool{
+	".pdf": true, ".doc": true, ".docx": true, ".xls": true, ".xlsx": true, ".ppt": true, ".pptx": true,
+	".odt": true, ".ods": true, ".odp": true, ".rtf": true, ".txt": true, ".csv": true,
+	".jpg": true, ".jpeg": true, ".png": true, ".gif": true, ".bmp": true, ".tif": true, ".tiff": true,
+	".mp3": true, ".mp4": true, ".mov": true, ".wav": true,
+}
+
+// pdfLaunchCanRun reports whether a /Launch action could start a program:
+// it passes command-line parameters (/Win /P, the classic cmd.exe trick), or
+// its target is a program or script, has no extension, or can't be read.
+// A launch that only opens another document is not flagged.
+func pdfLaunchCanRun(action types.Dict, deref func(types.Object) types.Object) bool {
+	target := ""
+	if win, ok := deref(action["Win"]).(types.Dict); ok {
+		if p, _ := types.StringOrHexLiteral(deref(win["P"])); p != nil && strings.TrimSpace(*p) != "" {
+			return true
+		}
+		target = pdfFileSpecName(win["F"], deref)
+	}
+	if target == "" {
+		target = pdfFileSpecName(action["F"], deref)
+	}
+	if target == "" {
+		return true
+	}
+	return !pdfDocumentExtensions[strings.ToLower(filepath.Ext(target))]
+}
+
+// pdfFileSpecName reads a file name from a PDF file specification: a plain
+// string, or a dictionary whose /UF or /F holds it.
+func pdfFileSpecName(o types.Object, deref func(types.Object) types.Object) string {
+	switch v := deref(o).(type) {
+	case types.Dict:
+		for _, k := range []string{"UF", "F", "DOS", "Unix", "Mac"} {
+			if s, _ := types.StringOrHexLiteral(deref(v[k])); s != nil && *s != "" {
+				return *s
+			}
+		}
+	default:
+		if s, _ := types.StringOrHexLiteral(v); s != nil {
+			return *s
+		}
+	}
+	return ""
+}
+
 func pdfName(o types.Object) string {
 	switch v := o.(type) {
 	case types.Name:
@@ -254,8 +304,36 @@ func pdfRawReasons(data []byte) []string {
 	if pdfRawJavaScript.Match(data) && pdfRawAutoRun.Match(data) {
 		reasons = append(reasons, reasonPDFAutoJS)
 	}
-	if pdfRawLaunch.Match(data) {
+	if pdfRawLaunchCanRun(data) {
 		reasons = append(reasons, reasonPDFLaunch)
 	}
 	return reasons
+}
+
+// pdfRawLiteral matches a short PDF string literal (no nested parentheses).
+var pdfRawLiteral = regexp.MustCompile(`\(([^()\\]{1,200})\)`)
+
+// pdfRawLaunchCanRun applies pdfLaunchCanRun's rule to raw bytes: it reads the
+// action text after each /Launch, so a link that only opens another document
+// is not flagged while parameters (/P) or a program target are.
+func pdfRawLaunchCanRun(data []byte) bool {
+	for _, loc := range pdfRawLaunch.FindAllIndex(data, -1) {
+		window := data[loc[0]:min(len(data), loc[1]+400)]
+		if end := bytes.Index(window, []byte("endobj")); end > 0 {
+			window = window[:end]
+		}
+		if bytes.Contains(window, []byte("/P")) && bytes.Contains(window, []byte("/Win")) {
+			return true
+		}
+		names := pdfRawLiteral.FindAllSubmatch(window, -1)
+		if len(names) == 0 {
+			return true
+		}
+		for _, n := range names {
+			if !pdfDocumentExtensions[strings.ToLower(filepath.Ext(string(n[1])))] {
+				return true
+			}
+		}
+	}
+	return false
 }
