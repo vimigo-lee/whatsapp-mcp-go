@@ -61,7 +61,7 @@ func checkBounds(t *testing.T, driver, dsn string) {
 		`DROP TABLE IF EXISTS messages`, `DROP TABLE IF EXISTS chats`,
 		`CREATE TABLE chats (jid TEXT PRIMARY KEY, name TEXT, last_message_time TIMESTAMP)`,
 		`CREATE TABLE messages (id TEXT, chat_jid TEXT, sender TEXT, content TEXT, timestamp TIMESTAMP,
-			is_from_me BOOLEAN, media_type TEXT, quoted_message_id TEXT, quoted_sender TEXT, quoted_content TEXT,
+			is_from_me BOOLEAN, media_type TEXT, quoted_message_id TEXT, quoted_sender TEXT, quoted_content TEXT, scan_status TEXT, scan_reason TEXT,
 			PRIMARY KEY (id, chat_jid))`,
 		`INSERT INTO chats VALUES ('60123456789@s.whatsapp.net', 'Ahmad', NULL)`,
 	} {
@@ -77,7 +77,7 @@ func checkBounds(t *testing.T, driver, dsn string) {
 		"LATE":  time.Date(2026, 10, 29, 2, 30, 0, 0, time.UTC).Unix(),
 	} {
 		q := `INSERT INTO messages VALUES (` + ph("1") + `, '60123456789@s.whatsapp.net', '60123456789', ` +
-			ph("2") + `, ` + ph("3") + `, false, NULL, NULL, NULL, NULL)`
+			ph("2") + `, ` + ph("3") + `, false, NULL, NULL, NULL, NULL, NULL, NULL)`
 		if _, err := db.Exec(q, id, id, time.Unix(sec, 0)); err != nil {
 			t.Fatal(err)
 		}

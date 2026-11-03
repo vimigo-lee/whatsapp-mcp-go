@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -78,11 +79,19 @@ type MessageInteraction struct {
 	QuotedMessageID string `json:"quoted_message_id,omitempty"`
 	QuotedSender    string `json:"quoted_sender,omitempty"`
 	QuotedContent   string `json:"quoted_content,omitempty"`
+	// The received file's verdict (filescan.go); empty for text and unchecked media.
+	ScanStatus string `json:"scan_status,omitempty"`
+	ScanReason string `json:"scan_reason,omitempty"`
 }
 
 // setQuote fills the reply fields from a row's nullable quoted_* columns.
 func (m *MessageInteraction) setQuote(id, sender, content sql.NullString) {
 	m.QuotedMessageID, m.QuotedSender, m.QuotedContent = id.String, sender.String, content.String
+}
+
+// setScan fills the file verdict from a row's nullable scan_* columns.
+func (m *MessageInteraction) setScan(status, reason sql.NullString) {
+	m.ScanStatus, m.ScanReason = status.String, reason.String
 }
 
 type Chat struct {
@@ -427,6 +436,19 @@ func NewMessageStore() (*MessageStore, error) {
 		_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS direct_path TEXT`)
 	} else {
 		_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN direct_path TEXT`)
+	}
+
+	// Received-file verdict (see filescan.go). scan_status/scan_reason start
+	// from the name and hash when the message arrives; scanned_at is stamped
+	// once the downloaded bytes have been checked.
+	if isPostgres {
+		_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS scan_status TEXT`)
+		_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS scan_reason TEXT`)
+		_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS scanned_at TIMESTAMP`)
+	} else {
+		_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN scan_status TEXT`)
+		_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN scan_reason TEXT`)
+		_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN scanned_at TIMESTAMP`)
 	}
 
 	return &MessageStore{db: db}, nil
@@ -1105,6 +1127,9 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, nullable(quotedID), nullable(quotedSender), nullable(quotedContent), isForwarded, nullable(directPath),
 		)
+		if err == nil && mediaType != "" {
+			store.recordPreScan(id, chatJID, preScanFile(mediaType, filename, fileSHA256))
+		}
 		return err
 	}
 	// direct_path keeps the stored value on a re-store: it is either the same
@@ -1134,8 +1159,51 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
     is_forwarded = messages.is_forwarded OR EXCLUDED.is_forwarded`,
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, nullable(quotedID), nullable(quotedSender), nullable(quotedContent), isForwarded, nullable(directPath),
 	)
+	if err == nil && mediaType != "" {
+		store.recordPreScan(id, chatJID, preScanFile(mediaType, filename, fileSHA256))
+	}
 
 	return err
+}
+
+// recordPreScan stores the name/hash verdict a message arrives with. It never
+// overwrites a verdict from the downloaded bytes (scanned_at set).
+func (store *MessageStore) recordPreScan(id, chatJID string, s FileScan) {
+	if s.Status == "" {
+		return
+	}
+	q := `UPDATE messages SET scan_status = ?, scan_reason = ? WHERE id = ? AND chat_jid = ? AND scanned_at IS NULL`
+	if isPostgres {
+		q = `UPDATE messages SET scan_status = $1, scan_reason = $2 WHERE id = $3 AND chat_jid = $4 AND scanned_at IS NULL`
+	}
+	if _, err := store.db.Exec(q, s.Status, nullable(s.Reason), id, chatJID); err != nil {
+		slog.Warn("failed to record file pre-scan", "message_id", id, "error", err)
+	}
+}
+
+// SaveFileScan stores the verdict from a downloaded file's bytes.
+func (store *MessageStore) SaveFileScan(id, chatJID string, s FileScan) error {
+	q := `UPDATE messages SET scan_status = ?, scan_reason = ?, scanned_at = ? WHERE id = ? AND chat_jid = ?`
+	if isPostgres {
+		q = `UPDATE messages SET scan_status = $1, scan_reason = $2, scanned_at = $3 WHERE id = $4 AND chat_jid = $5`
+	}
+	_, err := store.db.Exec(q, s.Status, nullable(s.Reason), time.Now(), id, chatJID)
+	return err
+}
+
+// GetFileScan returns a message's stored verdict and whether it came from the
+// downloaded bytes rather than just the name and hash.
+func (store *MessageStore) GetFileScan(id, chatJID string) (s FileScan, fromBytes bool) {
+	q := `SELECT scan_status, scan_reason, file_sha256, scanned_at IS NOT NULL FROM messages WHERE id = ? AND chat_jid = ?`
+	if isPostgres {
+		q = `SELECT scan_status, scan_reason, file_sha256, scanned_at IS NOT NULL FROM messages WHERE id = $1 AND chat_jid = $2`
+	}
+	var status, reason sql.NullString
+	var sha []byte
+	if err := store.db.QueryRow(q, id, chatJID).Scan(&status, &reason, &sha, &fromBytes); err != nil {
+		return FileScan{}, false
+	}
+	return FileScan{Status: status.String, Reason: reason.String, SHA256: hex.EncodeToString(sha)}, fromBytes
 }
 
 // nullable converts an empty string to a SQL NULL so optional columns (e.g. the
@@ -1871,10 +1939,9 @@ func extractMediaInfo(msg *waE2E.Message) (mediaType string, filename string, ur
 	}
 
 	if doc := msg.GetDocumentMessage(); doc != nil {
-		filename := doc.GetFileName()
-		if filename == "" {
-			filename = mediaStem("document", doc.GetFileSHA256())
-		}
+		// The sender picks this name; it becomes a path under the chat's media
+		// folder, so strip anything that could point elsewhere.
+		filename := safeMediaFilename(doc.GetFileName(), mediaStem("document", doc.GetFileSHA256()))
 		return "document", filename,
 			doc.GetURL(), doc.GetMediaKey(), doc.GetFileSHA256(), doc.GetFileEncSHA256(), doc.GetFileLength()
 	}
@@ -2229,12 +2296,21 @@ func buildWebhookPayload(client *whatsmeow.Client, evt *events.Message, storedCh
 	p["message_type"] = msgType
 	p["content"] = content
 
-	if mediaType, filename, mediaURL, mediaKey, _, _, fileLength := extractMediaInfo(m); mediaType != "" {
+	if mediaType, filename, mediaURL, mediaKey, fileSHA256, _, fileLength := extractMediaInfo(m); mediaType != "" {
 		p["media_type"] = mediaType
 		p["filename"] = filename
 		p["media_url"] = mediaURL
 		p["media_key"] = base64.StdEncoding.EncodeToString(mediaKey)
 		p["file_length"] = fileLength
+		// The name/hash verdict; the full one comes back from /download.
+		scan := preScanFile(mediaType, filename, fileSHA256)
+		if scan.SHA256 != "" {
+			p["file_sha256"] = scan.SHA256
+		}
+		if scan.Status != "" {
+			p["scan_status"] = scan.Status
+			p["scan_reason"] = scan.Reason
+		}
 	}
 
 	if ctx != nil {
@@ -2565,6 +2641,7 @@ type DownloadMediaResponse struct {
 	Message  string `json:"message"`
 	Filename string `json:"filename,omitempty"`
 	Path     string `json:"path,omitempty"`
+	FileScan
 }
 
 // StoreMediaInfo Store additional media info in the database
@@ -2706,7 +2783,34 @@ func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
 }
 
 // Function to download media from a message
-func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
+func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, FileScan, error) {
+	ok, mediaType, filename, path, data, err := fetchMedia(client, messageStore, messageID, chatJID)
+	if !ok || err != nil {
+		return ok, mediaType, filename, path, FileScan{}, err
+	}
+	// Check the bytes once; later calls reuse the stored verdict. The file is
+	// only read, never opened or unpacked, and is delivered either way.
+	scan, fromBytes := messageStore.GetFileScan(messageID, chatJID)
+	if !fromBytes {
+		if data == nil {
+			if data, err = os.ReadFile(path); err != nil {
+				return false, "", "", "", FileScan{}, fmt.Errorf("failed to read media for scanning: %v", err)
+			}
+		}
+		scan = scanFile(mediaType, filename, data)
+		if err := messageStore.SaveFileScan(messageID, chatJID, scan); err != nil {
+			slog.Warn("failed to save file scan", "message_id", messageID, "error", err)
+		}
+		if scan.Status != scanClean {
+			slog.Warn("flagged received file", "message_id", messageID, "chat_jid", chatJID, "status", scan.Status, "reason", scan.Reason, "sha256", scan.SHA256)
+		}
+	}
+	return true, mediaType, filename, path, scan, nil
+}
+
+// fetchMedia downloads a message's media to the chat's media folder (or finds
+// it already there). data holds the bytes when they were just downloaded.
+func fetchMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, []byte, error) {
 	var mediaType, filename, url string
 	var mediaKey, fileSHA256, fileEncSHA256 []byte
 	var fileLength uint64
@@ -2731,27 +2835,38 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		}
 
 		if err != nil {
-			return false, "", "", "", fmt.Errorf("failed to find message: %v", err)
+			return false, "", "", "", nil, fmt.Errorf("failed to find message: %v", err)
 		}
 	}
 
 	if mediaType == "" {
-		return false, "", "", "", fmt.Errorf("not a media message")
+		return false, "", "", "", nil, fmt.Errorf("not a media message")
 	}
 
 	if err := os.MkdirAll(chatDir, 0755); err != nil {
-		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
+		return false, "", "", "", nil, fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
+	// Rows stored before names were sanitized on arrival can still hold a
+	// sender's "../" path, so clean it again and refuse anything that would
+	// land outside the chat folder.
+	filename = safeMediaFilename(filename, mediaStem(mediaType, fileSHA256))
 	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
 
 	absPath, err := filepath.Abs(localPath)
 	if err != nil {
-		return false, "", "", "", fmt.Errorf("failed to get absolute path: %v", err)
+		return false, "", "", "", nil, fmt.Errorf("failed to get absolute path: %v", err)
+	}
+	absChatDir, err := filepath.Abs(chatDir)
+	if err != nil {
+		return false, "", "", "", nil, fmt.Errorf("failed to get absolute path: %v", err)
+	}
+	if filepath.Dir(absPath) != absChatDir {
+		return false, "", "", "", nil, fmt.Errorf("media filename escapes the chat folder: %q", filename)
 	}
 
 	if _, err := os.Stat(localPath); err == nil {
-		return true, mediaType, filename, absPath, nil
+		return true, mediaType, filename, absPath, nil, nil
 	}
 
 	// Candidate CDN paths, best first: the stored direct path (the message's own,
@@ -2764,14 +2879,14 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	if len(paths) == 0 || len(mediaKey) == 0 || len(fileSHA256) == 0 || len(fileEncSHA256) == 0 || fileLength == 0 {
-		return false, "", "", "", fmt.Errorf("incomplete media information for download")
+		return false, "", "", "", nil, fmt.Errorf("incomplete media information for download")
 	}
 
 	slog.Info("attempting to download media", "message_id", messageID, "chat_jid", chatJID)
 
 	waMediaType, ok := waMediaTypeFor(mediaType)
 	if !ok {
-		return false, "", "", "", fmt.Errorf("unsupported media type: %s", mediaType)
+		return false, "", "", "", nil, fmt.Errorf("unsupported media type: %s", mediaType)
 	}
 
 	downloader := &MediaDownloader{
@@ -2806,16 +2921,16 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 			mediaData, err = retryExpiredMedia(client, messageStore, messageID, chatJID, downloader)
 		}
 		if err != nil {
-			return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
+			return false, "", "", "", nil, fmt.Errorf("failed to download media: %v", err)
 		}
 	}
 
 	if err := os.WriteFile(localPath, mediaData, 0644); err != nil {
-		return false, "", "", "", fmt.Errorf("failed to save media file: %v", err)
+		return false, "", "", "", nil, fmt.Errorf("failed to save media file: %v", err)
 	}
 
 	slog.Info("successfully downloaded media", "media_type", mediaType, "key_type", downloader.MediaType, "path", absPath, "bytes", len(mediaData))
-	return true, mediaType, filename, absPath, nil
+	return true, mediaType, filename, absPath, mediaData, nil
 }
 
 // mediaRetryWaiter is the shared state for one in-flight media retry. The
@@ -3399,7 +3514,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 			return
 		}
 
-		success, mediaType, filename, path, err := downloadMedia(client, messageStore, req.MessageID, req.ChatJID)
+		success, mediaType, filename, path, scan, err := downloadMedia(client, messageStore, req.MessageID, req.ChatJID)
 
 		w.Header().Set("Content-Type", "application/json")
 
@@ -3422,6 +3537,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 			Message:  fmt.Sprintf("Successfully downloaded %s media", mediaType),
 			Filename: filename,
 			Path:     path,
+			FileScan: scan,
 		})
 	})
 
@@ -5512,6 +5628,12 @@ func (store *MessageStore) FormatMessage(msg MessageInteraction, showChatInfo bo
 		sb.WriteString(store.formatQuoteLine(msg))
 	}
 
+	// A flagged file says why before anyone downloads or opens it.
+	// Known malware says so in its reason; the marker is the same for every flag.
+	if msg.ScanStatus == scanMalware || msg.ScanStatus == scanSuspicious {
+		sb.WriteString("    ⤷ ⚠ flagged file: " + msg.ScanReason + "\n")
+	}
+
 	// Reactions on their own indented sub-line so they're clearly distinct from
 	// the message text (which may itself be long or contain brackets/pipes).
 	if rx := store.GetReactions(msg.ID); len(rx) > 0 {
@@ -5581,7 +5703,7 @@ func (store *MessageStore) ListMessages(s ListMessagesParams) (string, error) {
         SELECT 
             m.timestamp, m.sender, c.name, m.content, m.is_from_me, 
             c.jid, m.id, m.media_type,
-            m.quoted_message_id, m.quoted_sender, m.quoted_content
+            m.quoted_message_id, m.quoted_sender, m.quoted_content, m.scan_status, m.scan_reason
         FROM messages m
         JOIN chats c ON m.chat_jid = c.jid
     `
@@ -5654,7 +5776,8 @@ func (store *MessageStore) ListMessages(s ListMessagesParams) (string, error) {
 			qID, qSender, qContent sql.NullString
 		)
 
-		if err := rows.Scan(&ts, &sender, &chatName, &content, &isFromMe, &cJid, &id, &mediaType, &qID, &qSender, &qContent); err != nil {
+		var scanSt, scanRe sql.NullString
+		if err := rows.Scan(&ts, &sender, &chatName, &content, &isFromMe, &cJid, &id, &mediaType, &qID, &qSender, &qContent, &scanSt, &scanRe); err != nil {
 			log.Printf("scan error: %v", err)
 			continue
 		}
@@ -5675,6 +5798,7 @@ func (store *MessageStore) ListMessages(s ListMessagesParams) (string, error) {
 			m.MediaType = mediaType.String
 		}
 		m.setQuote(qID, qSender, qContent)
+		m.setScan(scanSt, scanRe)
 
 		msgs = append(msgs, m)
 	}
@@ -5796,7 +5920,7 @@ func (store *MessageStore) GetMessageContext(messageID string, before, after int
 	q := `
         SELECT m.timestamp, m.sender, c.name, m.content, m.is_from_me,
                c.jid, m.id, m.media_type, m.chat_jid,
-               m.quoted_message_id, m.quoted_sender, m.quoted_content
+               m.quoted_message_id, m.quoted_sender, m.quoted_content, m.scan_status, m.scan_reason
         FROM messages m
         JOIN chats c ON m.chat_jid = c.jid
         WHERE m.id = ` + placeholder(1)
@@ -5815,7 +5939,8 @@ func (store *MessageStore) GetMessageContext(messageID string, before, after int
 	)
 
 	row := store.db.QueryRow(q, messageID)
-	if err := row.Scan(&ts, &sender, &chatName, &content, &isFromMe, &chatJid, &id, &media, &chatJid2, &qID, &qSender, &qContent); err != nil {
+	var scanSt, scanRe sql.NullString
+	if err := row.Scan(&ts, &sender, &chatName, &content, &isFromMe, &chatJid, &id, &media, &chatJid2, &qID, &qSender, &qContent, &scanSt, &scanRe); err != nil {
 		if err == sql.ErrNoRows {
 			return MessageContext{}, fmt.Errorf("message not found: %s", messageID)
 		}
@@ -5837,11 +5962,12 @@ func (store *MessageStore) GetMessageContext(messageID string, before, after int
 		target.MediaType = media.String
 	}
 	target.setQuote(qID, qSender, qContent)
+	target.setScan(scanSt, scanRe)
 
 	qBefore := `
         SELECT m.timestamp, m.sender, c.name, m.content, m.is_from_me,
                c.jid, m.id, m.media_type,
-               m.quoted_message_id, m.quoted_sender, m.quoted_content
+               m.quoted_message_id, m.quoted_sender, m.quoted_content, m.scan_status, m.scan_reason
         FROM messages m
         JOIN chats c ON m.chat_jid = c.jid
         WHERE m.chat_jid = ` + placeholder(1) + `
@@ -5869,7 +5995,8 @@ func (store *MessageStore) GetMessageContext(messageID string, before, after int
 			bqID, bqSender, bqContent sql.NullString
 		)
 
-		if err := bRows.Scan(&bts, &bsender, &bname, &bcontent, &bif, &bjid, &bid, &bmedia, &bqID, &bqSender, &bqContent); err != nil {
+		var scanSt, scanRe sql.NullString
+		if err := bRows.Scan(&bts, &bsender, &bname, &bcontent, &bif, &bjid, &bid, &bmedia, &bqID, &bqSender, &bqContent, &scanSt, &scanRe); err != nil {
 			continue
 		}
 
@@ -5888,13 +6015,14 @@ func (store *MessageStore) GetMessageContext(messageID string, before, after int
 			m.MediaType = bmedia.String
 		}
 		m.setQuote(bqID, bqSender, bqContent)
+		m.setScan(scanSt, scanRe)
 		beforeMsgs = append(beforeMsgs, m)
 	}
 
 	qAfter := `
         SELECT m.timestamp, m.sender, c.name, m.content, m.is_from_me,
                c.jid, m.id, m.media_type,
-               m.quoted_message_id, m.quoted_sender, m.quoted_content
+               m.quoted_message_id, m.quoted_sender, m.quoted_content, m.scan_status, m.scan_reason
         FROM messages m
         JOIN chats c ON m.chat_jid = c.jid
         WHERE m.chat_jid = ` + placeholder(1) + `
@@ -5922,7 +6050,8 @@ func (store *MessageStore) GetMessageContext(messageID string, before, after int
 			aqID, aqSender, aqContent sql.NullString
 		)
 
-		if err := aRows.Scan(&ats, &asender, &aname, &acontent, &aif, &ajid, &aid, &amedia, &aqID, &aqSender, &aqContent); err != nil {
+		var scanSt, scanRe sql.NullString
+		if err := aRows.Scan(&ats, &asender, &aname, &acontent, &aif, &ajid, &aid, &amedia, &aqID, &aqSender, &aqContent, &scanSt, &scanRe); err != nil {
 			continue
 		}
 
@@ -5941,6 +6070,7 @@ func (store *MessageStore) GetMessageContext(messageID string, before, after int
 			m.MediaType = amedia.String
 		}
 		m.setQuote(aqID, aqSender, aqContent)
+		m.setScan(scanSt, scanRe)
 		afterMsgs = append(afterMsgs, m)
 	}
 
@@ -6251,7 +6381,7 @@ func (store *MessageStore) GetLastInteraction(jid string) (string, error) {
         SELECT 
             m.timestamp, m.sender, c.name, m.content, m.is_from_me,
             c.jid, m.id, m.media_type,
-            m.quoted_message_id, m.quoted_sender, m.quoted_content
+            m.quoted_message_id, m.quoted_sender, m.quoted_content, m.scan_status, m.scan_reason
         FROM messages m
         JOIN chats c ON m.chat_jid = c.jid
         WHERE m.sender = ` + placeholder(1) + `
@@ -6274,7 +6404,8 @@ func (store *MessageStore) GetLastInteraction(jid string) (string, error) {
 		qID, qSender, qContent sql.NullString
 	)
 
-	if err := row.Scan(&ts, &sender, &chatName, &content, &isFromMe, &chatJid, &id, &mediaType, &qID, &qSender, &qContent); err != nil {
+	var scanSt, scanRe sql.NullString
+	if err := row.Scan(&ts, &sender, &chatName, &content, &isFromMe, &chatJid, &id, &mediaType, &qID, &qSender, &qContent, &scanSt, &scanRe); err != nil {
 		if err == sql.ErrNoRows {
 			return "", nil
 		}
@@ -6297,6 +6428,7 @@ func (store *MessageStore) GetLastInteraction(jid string) (string, error) {
 		msg.MediaType = mediaType.String
 	}
 	msg.setQuote(qID, qSender, qContent)
+	msg.setScan(scanSt, scanRe)
 
 	return store.FormatMessage(msg, true), nil
 }

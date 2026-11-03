@@ -227,10 +227,20 @@ func SendAudioVoiceMessage(recipient, mediaPath string) (bool, string) {
 	return success, msg
 }
 
-func DownloadMedia(messageID, chatJID string) (string, error) {
+// FileScan is the bridge's verdict on a downloaded file. The bridge flags
+// files but always delivers them; the caller decides what to do.
+type FileScan struct {
+	Status   string `json:"scan_status,omitempty"`
+	Reason   string `json:"scan_reason,omitempty"`
+	RealType string `json:"real_type,omitempty"`
+	SHA256   string `json:"sha256,omitempty"`
+}
+
+func DownloadMedia(messageID, chatJID string) (string, FileScan, error) {
+	var scan FileScan
 	token, err := GetOrRefreshJwtToken()
 	if err != nil {
-		return "", fmt.Errorf("authentication failed: %w", err)
+		return "", scan, fmt.Errorf("authentication failed: %w", err)
 	}
 
 	payload := map[string]string{
@@ -246,33 +256,37 @@ func DownloadMedia(messageID, chatJID string) (string, error) {
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return "", scan, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("HTTP %d - %s", resp.StatusCode, string(body))
+		return "", scan, fmt.Errorf("HTTP %d - %s", resp.StatusCode, string(body))
 	}
 
-	var result map[string]interface{}
+	var result struct {
+		Success bool   `json:"success"`
+		Message string `json:"message"`
+		Path    string `json:"path"`
+		FileScan
+	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
+		return "", scan, err
 	}
 
-	if success, ok := result["success"].(bool); !ok || !success {
-		msg, _ := result["message"].(string)
+	if !result.Success {
+		msg := result.Message
 		if msg == "" {
 			msg = "Unknown error"
 		}
-		return "", errors.New(msg)
+		return "", scan, errors.New(msg)
 	}
 
-	path, ok := result["path"].(string)
-	if !ok || path == "" {
-		return "", errors.New("no path returned")
+	if result.Path == "" {
+		return "", scan, errors.New("no path returned")
 	}
 
-	log.Printf("Media downloaded: %s", path)
-	return path, nil
+	log.Printf("Media downloaded: %s", result.Path)
+	return result.Path, result.FileScan, nil
 }

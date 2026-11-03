@@ -23,7 +23,7 @@ func TestListMessagesShowsQuotedMessage(t *testing.T) {
 	for _, q := range []string{
 		`CREATE TABLE chats (jid TEXT PRIMARY KEY, name TEXT, last_message_time TIMESTAMP)`,
 		`CREATE TABLE messages (id TEXT, chat_jid TEXT, sender TEXT, content TEXT, timestamp TIMESTAMP,
-			is_from_me BOOLEAN, media_type TEXT, quoted_message_id TEXT, quoted_sender TEXT, quoted_content TEXT,
+			is_from_me BOOLEAN, media_type TEXT, quoted_message_id TEXT, quoted_sender TEXT, quoted_content TEXT, scan_status TEXT, scan_reason TEXT,
 			PRIMARY KEY (id, chat_jid))`,
 		`INSERT INTO chats VALUES ('120363@g.us', 'Finance', NULL)`,
 		`INSERT INTO chats VALUES ('60123456789@s.whatsapp.net', 'Ali', NULL)`,
@@ -38,7 +38,7 @@ func TestListMessagesShowsQuotedMessage(t *testing.T) {
 		{"CARD1", "60123456789", card, at(2), nil, nil, nil},
 		{"REPLY1", "60199999999", "received 42868.80", at(20), "CARD1", "60123456789@s.whatsapp.net", card},
 	} {
-		if _, err := db.Exec(`INSERT INTO messages VALUES (?, '120363@g.us', ?, ?, ?, 0, NULL, ?, ?, ?)`, row...); err != nil {
+		if _, err := db.Exec(`INSERT INTO messages VALUES (?, '120363@g.us', ?, ?, ?, 0, NULL, ?, ?, ?, NULL, NULL)`, row...); err != nil {
 			t.Fatal(err)
 		}
 	}
