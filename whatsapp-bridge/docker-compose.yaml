@@ -55,6 +55,9 @@ services:
     environment:
       WHATSAPP_API_KEY: "${WHATSAPP_API_KEY:?set WHATSAPP_API_KEY in environment or .env}"
       API_BASE_URL: "http://wa-bridge:8080/api"
+      # Recommended: set it, and send "Authorization: Bearer <token>" from clients.
+      # Unset, only loopback/private-network clients are accepted.
+      MCP_HTTP_TOKEN: "${MCP_HTTP_TOKEN:-}"
       IS_HTTP: "true"
       HTTP_BASE_URL: "0.0.0.0:5777"
       LOG_LEVEL: "${LOG_LEVEL:-info}"

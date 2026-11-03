@@ -118,10 +118,12 @@ fits a long-running container — see "MCP server: stdio vs HTTP" below
 for when to use each.
 
 ```bash
-# 1. Set the four required vars (in .env at repo root, or in your shell)
+# 1. Set the four required vars, plus the recommended MCP_HTTP_TOKEN
+#    (in .env at repo root, or in your shell)
 cat > .env <<EOF
 WHATSAPP_API_KEY=$(openssl rand -base64 48)
 WHATSAPP_JWT_SECRET=$(openssl rand -base64 48)
+MCP_HTTP_TOKEN=$(openssl rand -base64 48)
 POSTGRES_USER=whatsapp
 POSTGRES_PASS=$(openssl rand -base64 24)
 EOF
@@ -132,7 +134,7 @@ docker compose up
 
 Once running:
 - Bridge REST API: `http://localhost:8080/api/...` (after `/auth/login`)
-- MCP HTTP endpoint: `http://localhost:5777`
+- MCP HTTP endpoint: `http://localhost:5777` (send `Authorization: Bearer <MCP_HTTP_TOKEN>` if you set one)
 
 ### MCP server: stdio vs HTTP
 
@@ -142,6 +144,14 @@ The MCP server has two run modes selected by `IS_HTTP`:
 | --- | --- | --- |
 | **stdio** (`IS_HTTP=false`, default) | Claude Desktop, Cursor, or any host that spawns the MCP server as a child process | `go build` a local binary; reference it from `claude_desktop_config.json` / `mcp.json` (see below) |
 | **HTTP** (`IS_HTTP=true`) | n8n, web automation, or any client connecting over the network | `docker compose up` — the `wa-mcp` service runs in HTTP mode by default, listening on `:5777` |
+
+The server holds your bridge credential, so anyone who reaches the HTTP port
+can read and send as your WhatsApp. Set `MCP_HTTP_TOKEN` (at least 32
+characters) and every request must then carry `Authorization: Bearer
+<MCP_HTTP_TOKEN>`. Without it, the server only accepts clients on loopback or
+a private network (Docker networks, your LAN, a tailnet) and refuses public
+addresses. That does not protect you if you put a reverse proxy in front of
+the port, so set the token before exposing it.
 
 Stdio mode is **not** appropriate for the Docker image — Claude Desktop
 does not natively `docker run` to spawn an MCP child. Build a local

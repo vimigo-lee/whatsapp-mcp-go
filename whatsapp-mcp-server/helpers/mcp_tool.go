@@ -3,6 +3,7 @@ package helpers
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -10,7 +11,9 @@ import (
 	"log"
 	"log/slog"
 	"mime"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path"
@@ -200,12 +203,23 @@ func InitMcpTool() {
 	ctx := context.Background()
 
 	if isHttp {
+		token, err := mcpHTTPToken()
+		if err != nil {
+			log.Fatalf("%v", err)
+		}
 		addr := ReadEnv("HTTP_BASE_URL", "0.0.0.0:5777")
 		slog.Info("Starting WhatsApp MCP HTTP streaming", "addr", addr)
 
-		handler := mcp.NewStreamableHTTPHandler(func(req *http.Request) *mcp.Server {
+		mcpHandler := mcp.NewStreamableHTTPHandler(func(req *http.Request) *mcp.Server {
 			return server
 		}, nil)
+		var handler http.Handler
+		if token != "" {
+			handler = requireBearerToken(token, mcpHandler)
+		} else {
+			slog.Warn("MCP_HTTP_TOKEN is not set: only loopback and private-network clients are accepted, and any of them can use every tool as this WhatsApp account. Set MCP_HTTP_TOKEN (openssl rand -base64 48) and send it as 'Authorization: Bearer <token>'.")
+			handler = privateNetworkOnly(mcpHandler)
+		}
 		if err := http.ListenAndServe(addr, handler); err != nil {
 			log.Fatalf("Server failed: %v", err)
 		}
@@ -972,6 +986,60 @@ func uploadMediaDescription() string {
 func servesRemoteClients() bool {
 	v := strings.ToLower(ReadEnv("IS_HTTP", "false"))
 	return v == "true" || v == "1"
+}
+
+const minHTTPTokenLen = 32
+
+// mcpHTTPToken returns the bearer token HTTP clients must present, or "" when
+// none is configured. Every tool runs with this server's bridge credential, so
+// a token that is set but weak is refused outright; an unset token keeps
+// existing deployments working behind privateNetworkOnly.
+func mcpHTTPToken() (string, error) {
+	token := ReadEnv("MCP_HTTP_TOKEN", "")
+	if token != "" && len(token) < minHTTPTokenLen {
+		return "", fmt.Errorf("MCP_HTTP_TOKEN is too short (%d chars, need ≥%d); generate one with `openssl rand -base64 48`", len(token), minHTTPTokenLen)
+	}
+	return token, nil
+}
+
+// sharedAddressSpace is 100.64.0.0/10 (RFC 6598), used by carrier NAT and by
+// Tailscale; it is not reachable from the public internet.
+var sharedAddressSpace = netip.MustParsePrefix("100.64.0.0/10")
+
+// privateNetworkOnly serves only peers on loopback or a private network
+// (Docker networks, the LAN, a tailnet) and refuses public addresses. It is the
+// fallback when no MCP_HTTP_TOKEN is set, so a port published to the internet
+// does not hand the owner's WhatsApp to strangers.
+func privateNetworkOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		ip, perr := netip.ParseAddr(host)
+		if err != nil || perr != nil {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		ip = ip.Unmap()
+		if !ip.IsLoopback() && !ip.IsPrivate() && !sharedAddressSpace.Contains(ip) {
+			slog.Warn("refused MCP request from public address; set MCP_HTTP_TOKEN to allow authenticated remote clients", "remote", ip.String())
+			http.Error(w, "forbidden: set MCP_HTTP_TOKEN on the server and send it as a bearer token", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// requireBearerToken rejects any request whose Authorization header is not
+// "Bearer <token>" before the MCP handler sees it.
+func requireBearerToken(token string, next http.Handler) http.Handler {
+	want := []byte("Bearer " + token)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), want) != 1 {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="whatsapp-mcp"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // callerFilesReadable reports whether this process shares a filesystem with
