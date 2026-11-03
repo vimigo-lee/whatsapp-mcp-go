@@ -227,11 +227,23 @@ type listMessagesInput struct {
 	SenderPhoneNumber *string `json:"sender_phone_number,omitempty"`
 	ChatJid           *string `json:"chat_jid,omitempty"`
 	Query             *string `json:"query,omitempty" jsonschema:"description:Search term in message content"`
-	Limit             int     `json:"limit" jsonschema:"default:20"`
-	Page              int     `json:"page" jsonschema:"default:0"`
-	IncludeContext    bool    `json:"include_context" jsonschema:"default:true"`
-	ContextBefore     int     `json:"context_before" jsonschema:"default:1"`
-	ContextAfter      int     `json:"context_after" jsonschema:"default:1"`
+	Limit             int     `json:"limit,omitempty" jsonschema:"Optional. Max matching messages to return (default 20)"`
+	Page              int     `json:"page,omitempty" jsonschema:"Optional. Zero-based page of results (default 0)"`
+	IncludeContext    bool    `json:"include_context,omitempty" jsonschema:"Optional. Also return the messages around each match (default false)"`
+	ContextBefore     *int    `json:"context_before,omitempty" jsonschema:"Optional. With include_context, messages before each match (default 1, max 10)"`
+	ContextAfter      *int    `json:"context_after,omitempty" jsonschema:"Optional. With include_context, messages after each match (default 1, max 10)"`
+}
+
+// listMessagesDefaultLimit applies when the caller sends no limit; without it the
+// bridge falls back to its own default of 50.
+const listMessagesDefaultLimit = 20
+
+// contextSize resolves an optional context_before/context_after to 0..10, 1 when unset.
+func contextSize(v *int) int {
+	if v == nil {
+		return 1
+	}
+	return min(max(*v, 0), 10)
 }
 
 type getMessageContextInput struct {
@@ -537,9 +549,16 @@ func listMessagesHandler(
 	if in.Query != nil {
 		q += "&search=" + url.QueryEscape(*in.Query)
 	}
-	q += fmt.Sprintf("&limit=%d&page=%d", in.Limit, in.Page)
+	limit := in.Limit
+	if limit <= 0 {
+		limit = listMessagesDefaultLimit
+	}
+	q += fmt.Sprintf("&limit=%d&page=%d", limit, max(in.Page, 0))
+	// The sizes must travel with the flag: on its own, context=true makes the
+	// bridge wrap every match in 5 messages either side.
 	if in.IncludeContext {
-		q += "&context=true"
+		q += fmt.Sprintf("&context=true&context_before=%d&context_after=%d",
+			contextSize(in.ContextBefore), contextSize(in.ContextAfter))
 	}
 
 	data, err := callAPI(http.MethodGet, "/messages?"+strings.TrimPrefix(q, "&"), nil)

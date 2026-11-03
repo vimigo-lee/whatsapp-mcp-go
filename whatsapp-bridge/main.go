@@ -4043,6 +4043,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 		if ctx := q.Get("context"); ctx == "true" {
 			params.IncludeContext = true
 		}
+		params.ContextBefore = contextParam(q.Get("context_before"), params.ContextBefore)
+		params.ContextAfter = contextParam(q.Get("context_after"), params.ContextAfter)
 
 		result, err := messageStore.ListMessages(params)
 		if err != nil {
@@ -5855,21 +5857,42 @@ func (store *MessageStore) ListMessages(s ListMessagesParams) (string, error) {
 	}
 
 	if s.IncludeContext && len(msgs) > 0 {
+		// Matches close together in one chat share their surroundings; each
+		// message is listed once, where it first appears.
 		var all []MessageInteraction
+		seen := map[string]bool{}
+		add := func(ms ...MessageInteraction) {
+			for _, m := range ms {
+				key := m.ChatJID + "\x00" + m.ID
+				if !seen[key] {
+					seen[key] = true
+					all = append(all, m)
+				}
+			}
+		}
 		for _, m := range msgs {
 			ctx, err := store.GetMessageContext(m.ID, s.ContextBefore, s.ContextAfter)
 			if err != nil {
 				log.Printf("context error for %s: %v", m.ID, err)
 				continue
 			}
-			all = append(all, ctx.Before...)
-			all = append(all, ctx.Message)
-			all = append(all, ctx.After...)
+			add(ctx.Before...)
+			add(ctx.Message)
+			add(ctx.After...)
 		}
 		return store.FormatMessagesList(all, true), nil
 	}
 
 	return store.FormatMessagesList(msgs, true), nil
+}
+
+// contextParam reads a /messages context size. 0 is a real choice (only the
+// matches), so only a missing or bad value keeps the default.
+func contextParam(raw string, def int) int {
+	if v, err := strconv.Atoi(raw); err == nil && v >= 0 {
+		return v
+	}
+	return def
 }
 
 // quoteSource is what a reply needs from the message it quotes.

@@ -31,6 +31,28 @@ func TestListMessagesSchemaAfterOptional(t *testing.T) {
 	}
 }
 
+func TestListMessagesContextOptional(t *testing.T) {
+	s, err := jsonschema.For[listMessagesInput](nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range s.Required {
+		switch r {
+		case "limit", "page", "include_context", "context_before", "context_after":
+			t.Fatalf("%s must be optional, required=%v", r, s.Required)
+		}
+	}
+	zero, three, big, neg := 0, 3, 50, -2
+	for _, c := range []struct {
+		in   *int
+		want int
+	}{{nil, 1}, {&zero, 0}, {&three, 3}, {&big, 10}, {&neg, 0}} {
+		if got := contextSize(c.in); got != c.want {
+			t.Fatalf("contextSize(%v) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
 func TestSendContactSchema(t *testing.T) {
 	s, err := jsonschema.For[sendContactInput](nil)
 	if err != nil {
