@@ -71,7 +71,7 @@ func TestScanFile(t *testing.T) {
 		{"image that is a zip", "image", "image_ab.jpg", makeZip(t, "x.txt"), scanSuspicious, "sent as image but is really zip"},
 		{"animated sticker zip is fine", "sticker", "sticker_ab.webp", makeZip(t, "animation/animation.json"), scanClean, ""},
 		{"office macros", "document", "q.docm", makeZip(t, "word/document.xml", "word/vbaProject.bin"), scanSuspicious, "Office file with macros"},
-		{"pdf with javascript", "document", "form.pdf", []byte("%PDF-1.7\n1 0 obj << /OpenAction << /S /JavaScript /JS (app.alert(1)) >> >>"), scanSuspicious, "PDF contains JavaScript"},
+		{"pdf running javascript on open", "document", "form.pdf", []byte("%PDF-1.7\n1 0 obj << /OpenAction << /S /JavaScript /JS (app.alert(1)) >> >>"), scanSuspicious, "PDF runs JavaScript when opened"},
 		{"plain pdf", "document", "plain.pdf", []byte("%PDF-1.7\n1 0 obj << /Type /Catalog /JSON 1 >>"), scanClean, ""},
 		{"web page named txt", "document", "notes.txt", []byte("<!DOCTYPE html><script>x()</script>"), scanSuspicious, "really a web page"},
 		{"voice note amr", "audio", "audio_ab.ogg", []byte("#!AMR\n\x00\x00"), scanClean, ""},
@@ -177,16 +177,16 @@ func TestScanVerdictInListMessages(t *testing.T) {
 	}
 
 	// A byte scan wins over the arrival verdict, and a later re-store keeps it.
-	if err := s.SaveFileScan("OK1", chat, FileScan{Status: scanSuspicious, Reason: "PDF contains JavaScript"}); err != nil {
+	if err := s.SaveFileScan("OK1", chat, FileScan{Status: scanSuspicious, Reason: "PDF runs JavaScript when opened"}); err != nil {
 		t.Fatal(err)
 	}
 	s.recordPreScan("OK1", chat, FileScan{Status: scanSuspicious, Reason: "should not overwrite"})
 	got, fromBytes := s.GetFileScan("OK1", chat)
-	if !fromBytes || got.Reason != "PDF contains JavaScript" || got.SHA256 != "09" {
+	if !fromBytes || got.Reason != "PDF runs JavaScript when opened" || got.SHA256 != "09" {
 		t.Errorf("GetFileScan = %+v fromBytes=%v", got, fromBytes)
 	}
 	out, _ = s.ListMessages(ListMessagesParams{ChatJid: &chat, Limit: 10})
-	if !strings.Contains(out, "⤷ ⚠ flagged file: PDF contains JavaScript") {
+	if !strings.Contains(out, "⤷ ⚠ flagged file: PDF runs JavaScript when opened") {
 		t.Errorf("byte-scan flag missing:\n%s", out)
 	}
 }

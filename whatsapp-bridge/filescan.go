@@ -314,24 +314,6 @@ func zipReasons(data []byte) []string {
 	return reasons
 }
 
-// pdfLaunch and pdfJavaScript match the PDF actions that run things. A name
-// token must end at a delimiter, so /JSON or /Launcher don't count.
-var (
-	pdfLaunch     = regexp.MustCompile(`/Launch[\s/<>\[\]()]`)
-	pdfJavaScript = regexp.MustCompile(`/(JavaScript|JS)[\s/<>\[\]()]`)
-)
-
-func pdfReasons(data []byte) []string {
-	var reasons []string
-	if pdfLaunch.Match(data) {
-		reasons = append(reasons, "PDF can launch programs")
-	}
-	if pdfJavaScript.Match(data) {
-		reasons = append(reasons, "PDF contains JavaScript")
-	}
-	return reasons
-}
-
 func utf16le(s string) []byte {
 	out := make([]byte, 0, len(s)*2)
 	for _, r := range s {
