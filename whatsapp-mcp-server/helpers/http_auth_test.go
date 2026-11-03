@@ -67,6 +67,7 @@ func TestPrivateNetworkOnlyWithoutToken(t *testing.T) {
 	for remote, want := range cases {
 		req := httptest.NewRequest(http.MethodPost, "/", nil)
 		req.RemoteAddr = remote
+		req.Host = "localhost:5777" // the Host check has its own test
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 		if rec.Code != want {

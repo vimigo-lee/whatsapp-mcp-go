@@ -126,10 +126,17 @@ func pdfObjectReasons(ctx *model.Context) (reasons []string) {
 		}
 		return d
 	}
-	// Each indirect object is judged once. Without the memo, an array whose
-	// elements refer back to itself fans out to N^9 calls, and a few hundred
-	// bytes keep a CPU busy for as long as the scan runs.
-	jsMemo := map[int]bool{}
+	// Without a memo, an array whose elements refer back to itself fans out to
+	// N^9 calls, and a few hundred bytes keep a CPU busy for as long as the
+	// scan runs. A "no" found deep down may only mean the depth limit cut the
+	// search short, so it is reused only at the same depth or deeper; reached
+	// again higher up, the object is judged again with more room. That bounds
+	// the work to 9 judgements per object.
+	type judged struct {
+		js    bool
+		depth int
+	}
+	jsMemo := map[int]judged{}
 	var isJS func(o types.Object, depth int) bool
 	isJS = func(o types.Object, depth int) bool {
 		if depth > 8 {
@@ -140,12 +147,12 @@ func pdfObjectReasons(ctx *model.Context) (reasons []string) {
 			return isJSValue(deref(o), depth, isJS)
 		}
 		nr := ir.ObjectNumber.Value()
-		if v, seen := jsMemo[nr]; seen {
-			return v
+		if j, seen := jsMemo[nr]; seen && (j.js || j.depth <= depth) {
+			return j.js
 		}
-		jsMemo[nr] = false // an object that refers back to itself is not JavaScript
+		jsMemo[nr] = judged{false, depth} // an object that refers back to itself is not JavaScript
 		v := isJSValue(deref(o), depth, isJS)
-		jsMemo[nr] = v
+		jsMemo[nr] = judged{v, depth}
 		return v
 	}
 

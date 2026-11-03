@@ -45,7 +45,10 @@ func plainHTTPOverPublicNetwork(raw string) bool {
 		ip = ip.Unmap()
 		return !ip.IsLoopback() && !ip.IsPrivate() && !sharedAddressSpace.Contains(ip)
 	}
-	return host != "localhost" && strings.Contains(host, ".")
+	if host == "localhost" || host == "host.docker.internal" || strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") {
+		return false
+	}
+	return strings.Contains(host, ".")
 }
 
 const apiTimeout = 60 * time.Second

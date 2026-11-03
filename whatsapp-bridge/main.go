@@ -2641,13 +2641,21 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			// Only the author may change a row (see UpdateOwnMessageContent);
 			// in a group an admin may also delete someone else's message.
 			senders := []string{sender}
-			if raw := msg.Info.Sender.User; raw != "" && raw != sender {
-				senders = append(senders, raw)
+			// A row may have been stored under the author's LID or phone number,
+			// whichever was known then, so both spellings count as the author.
+			for _, alt := range []string{msg.Info.Sender.User, msg.Info.SenderAlt.User} {
+				if alt != "" && !slices.Contains(senders, alt) {
+					senders = append(senders, alt)
+				}
 			}
 			switch pm.GetType() {
 			case waE2E.ProtocolMessage_REVOKE:
 				changed, err := messageStore.DeleteOwnMessage(chatJID, target, msg.Info.IsFromMe, senders)
-				if err == nil && !changed && msg.Info.IsGroup && isGroupAdmin(client, msg.Info.Chat, msg.Info.Sender) {
+				// The admin check asks WhatsApp for the group's members, so it only
+				// runs for a message we actually hold: revokes of made-up IDs must
+				// not turn into a stream of server calls.
+				_, _, exists := messageStore.messageAuthor(target, chatJID)
+				if err == nil && !changed && exists && msg.Info.IsGroup && isGroupAdmin(client, msg.Info.Chat, msg.Info.Sender) {
 					err = messageStore.DeleteMessage(chatJID, target)
 					changed = err == nil
 				}
@@ -2990,7 +2998,8 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 // like "x@/../../elsewhere" must never reach the store.
 func storableChatJID(jid types.JID) bool {
 	switch jid.Server {
-	case types.DefaultUserServer, types.GroupServer, types.HiddenUserServer, types.NewsletterServer, types.BroadcastServer:
+	case types.DefaultUserServer, types.GroupServer, types.HiddenUserServer, types.NewsletterServer, types.BroadcastServer,
+		types.BotServer, types.HostedServer, types.HostedLIDServer, types.MessengerServer, types.InteropServer:
 	default:
 		return false
 	}
@@ -3006,6 +3015,25 @@ func fileMatchesSHA256(data, want []byte) bool {
 	}
 	sum := sha256.Sum256(data)
 	return bytes.Equal(sum[:], want)
+}
+
+// fileAtPathMatchesSHA256 is fileMatchesSHA256 for a file on disk, hashed as
+// a stream so a large video is not read into memory just to be compared. The
+// error is the open error: a missing file is a free name.
+func fileAtPathMatchesSHA256(path string, want []byte) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	if len(want) != sha256.Size {
+		return true, nil
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return false, nil
+	}
+	return bytes.Equal(h.Sum(nil), want), nil
 }
 
 // fetchMedia downloads a message's media to the chat's media folder (or finds
@@ -3076,12 +3104,13 @@ func fetchMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID,
 		if filepath.Dir(absPath) != absChatDir {
 			return false, "", "", "", nil, fmt.Errorf("media filename escapes the chat folder: %q", filename)
 		}
-		existing, err := os.ReadFile(localPath)
+		matches, err := fileAtPathMatchesSHA256(localPath, fileSHA256)
 		if err != nil {
 			break // free name: download to it
 		}
-		if fileMatchesSHA256(existing, fileSHA256) {
-			return true, mediaType, filename, absPath, existing, nil
+		if matches {
+			// nil data: the caller reads the file only if it still needs scanning.
+			return true, mediaType, filename, absPath, nil, nil
 		}
 	}
 
@@ -5807,9 +5836,11 @@ func (store *MessageStore) FormatMessage(msg MessageInteraction, showChatInfo bo
 	// react to or download that exact message. Media lines keep their original
 	// "[type - Message ID: … - Chat JID: …]" shape; text lines get the same
 	// bracket without the type.
-	prefix := fmt.Sprintf("[Message ID: %s - Chat JID: %s] ", msg.ID, msg.ChatJID)
+	// Message IDs are chosen by the sending client, so they are kept to one
+	// line like every other sender-written field.
+	prefix := fmt.Sprintf("[Message ID: %s - Chat JID: %s] ", oneLine(msg.ID), oneLine(msg.ChatJID))
 	if msg.MediaType != "" {
-		prefix = fmt.Sprintf("[%s - Message ID: %s - Chat JID: %s] ", msg.MediaType, msg.ID, msg.ChatJID)
+		prefix = fmt.Sprintf("[%s - Message ID: %s - Chat JID: %s] ", oneLine(msg.MediaType), oneLine(msg.ID), oneLine(msg.ChatJID))
 	}
 
 	// The sender's number (or LID user when unmapped) follows the display name,
@@ -5875,7 +5906,9 @@ func (store *MessageStore) formatQuoteLine(msg MessageInteraction) string {
 	if r := []rune(preview); len(r) > quotePreviewMaxRunes {
 		preview = string(r[:quotePreviewMaxRunes]) + "…"
 	}
-	return fmt.Sprintf("    ⤷ replying to %s [Message ID: %s]: %s\n", who, msg.QuotedMessageID, preview)
+	// The quoted ID is the sender's own stanzaId field, so it is as untrusted
+	// as their text.
+	return fmt.Sprintf("    ⤷ replying to %s [Message ID: %s]: %s\n", oneLine(who), oneLine(msg.QuotedMessageID), preview)
 }
 
 // quotePreviewMaxRunes caps the quoted preview so a long card doesn't swamp
@@ -5958,7 +5991,9 @@ func (store *MessageStore) ListMessages(s ListMessagesParams) (string, error) {
 	}
 
 	if s.Query != nil && *s.Query != "" {
-		where = append(where, "LOWER(m.content) LIKE LOWER("+placeholder(len(args)+1)+")")
+		// A message deleted for everyone is not searched: a hit would show
+		// "[message deleted]" yet tell the searcher what the text contained.
+		where = append(where, "m.deleted_at IS NULL AND LOWER(m.content) LIKE LOWER("+placeholder(len(args)+1)+")")
 		args = append(args, "%"+*s.Query+"%")
 	}
 

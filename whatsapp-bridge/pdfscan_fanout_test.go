@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -33,5 +34,22 @@ func TestPDFSharedJavaScriptActionStillFlagged(t *testing.T) {
 	)
 	if got := pdfReasons(data); !sameReasons(got, []string{reasonPDFAutoJS}) {
 		t.Errorf("reasons = %v, want %v", got, []string{reasonPDFAutoJS})
+	}
+}
+
+// A "no" reached at the depth limit must not stick: object 11 is first seen
+// at depth 8, where its /Next is cut off, then again at depth 2, where its
+// /Next is an auto-run JavaScript action.
+func TestPDFMemoDoesNotReuseDepthLimitedNo(t *testing.T) {
+	objs := []string{
+		"<< /Type /Catalog /Pages 2 0 R /OpenAction 4 0 R >>", pdfPages, pdfPage,
+		"<< /S /GoTo /D [3 0 R /Fit] /Next [5 0 R 11 0 R] >>",
+	}
+	for i := 5; i <= 10; i++ {
+		objs = append(objs, fmt.Sprintf("<< /S /GoTo /D [3 0 R /Fit] /Next %d 0 R >>", i+1))
+	}
+	objs = append(objs, "<< /S /GoTo /D [3 0 R /Fit] /Next 12 0 R >>", "<< /S /JavaScript /JS (app.alert(1);) >>")
+	if got := pdfReasons(buildPDF(objs...)); !sameReasons(got, []string{reasonPDFAutoJS}) {
+		t.Errorf("auto-run JavaScript behind a long branch missed: %v", got)
 	}
 }

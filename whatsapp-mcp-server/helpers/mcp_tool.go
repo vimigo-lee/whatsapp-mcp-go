@@ -1040,9 +1040,32 @@ func publicAddressOnly(_, address string, _ syscall.RawConn) error {
 	return nil
 }
 
+// IPv6 forms that carry an IPv4 address inside. NAT64 (64:ff9b::/96) is
+// judged by the address it wraps; the others (local NAT64, 6to4, Teredo,
+// IPv4-compatible) have no business in a media link and are refused.
+var (
+	nat64Prefix     = netip.MustParsePrefix("64:ff9b::/96")
+	wrappedV4Ranges = []netip.Prefix{
+		netip.MustParsePrefix("64:ff9b:1::/48"),
+		netip.MustParsePrefix("2002::/16"),
+		netip.MustParsePrefix("2001::/32"),
+		netip.MustParsePrefix("::/96"),
+	}
+	thisNetwork = netip.MustParsePrefix("0.0.0.0/8")
+)
+
 func isPublicAddr(ip netip.Addr) bool {
 	ip = ip.Unmap()
-	return ip.IsGlobalUnicast() && !ip.IsPrivate() && !sharedAddressSpace.Contains(ip)
+	if nat64Prefix.Contains(ip) {
+		b := ip.As16()
+		return isPublicAddr(netip.AddrFrom4([4]byte(b[12:])))
+	}
+	for _, p := range wrappedV4Ranges {
+		if p.Contains(ip) {
+			return false
+		}
+	}
+	return ip.IsGlobalUnicast() && !ip.IsPrivate() && !sharedAddressSpace.Contains(ip) && !thisNetwork.Contains(ip)
 }
 
 // privateNetworkOnly serves only peers on loopback or a private network
@@ -1063,16 +1086,60 @@ func privateNetworkOnly(next http.Handler) http.Handler {
 			http.Error(w, "forbidden: set MCP_HTTP_TOKEN on the server and send it as a bearer token", http.StatusForbidden)
 			return
 		}
+		// A web page can point its own domain at a private address (DNS
+		// rebinding) and so reach this server from the user's browser, with a
+		// private peer address. Such a request carries that domain as Host.
+		if !localHostHeader(r.Host) {
+			slog.Warn("refused MCP request for an unexpected Host; list it in MCP_ALLOWED_HOSTS or set MCP_HTTP_TOKEN", "host", r.Host)
+			http.Error(w, "forbidden: unexpected Host", http.StatusForbidden)
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// localHostHeader accepts the Host forms a local or Docker client uses: an IP
+// address, localhost, or a single-label name such as a compose service
+// (wa-mcp). Dotted names are what DNS rebinding needs, so those must be listed
+// in MCP_ALLOWED_HOSTS.
+func localHostHeader(hostport string) bool {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	host = strings.ToLower(strings.Trim(host, "[]"))
+	if host == "" {
+		return false
+	}
+	if _, err := netip.ParseAddr(host); err == nil {
+		return true
+	}
+	if host == "localhost" || !strings.Contains(host, ".") {
+		return true
+	}
+	// Names that never resolve on the public internet, so a web page's owner
+	// cannot point one at this server: mDNS, home routers, tailnets.
+	for _, suffix := range []string{".localhost", ".local", ".lan", ".home.arpa", ".internal", ".localdomain", ".ts.net"} {
+		if strings.HasSuffix(host, suffix) {
+			return true
+		}
+	}
+	for _, allowed := range strings.Split(os.Getenv("MCP_ALLOWED_HOSTS"), ",") {
+		if a := strings.ToLower(strings.TrimSpace(allowed)); a != "" && a == host {
+			return true
+		}
+	}
+	return false
 }
 
 // requireBearerToken rejects any request whose Authorization header is not
 // "Bearer <token>" before the MCP handler sees it.
 func requireBearerToken(token string, next http.Handler) http.Handler {
-	want := []byte("Bearer " + token)
+	want := []byte(token)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), want) != 1 {
+		// The scheme name is case-insensitive (RFC 7235); the token is not.
+		got := r.Header.Get("Authorization")
+		if len(got) < 7 || !strings.EqualFold(got[:7], "Bearer ") || subtle.ConstantTimeCompare([]byte(got[7:]), want) != 1 {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="whatsapp-mcp"`)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return

@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"strings"
@@ -113,11 +114,37 @@ func publicAddressOnly(network, address string, _ syscall.RawConn) error {
 	return nil
 }
 
-func isPublicIP(ip net.IP) bool {
-	if v4 := ip.To4(); v4 != nil {
-		ip = v4
+// IPv6 forms that carry an IPv4 address inside. NAT64 (64:ff9b::/96) is
+// judged by the address it wraps; the others (local NAT64, 6to4, Teredo,
+// IPv4-compatible) have no business in a link preview and are refused.
+var (
+	nat64Prefix     = netip.MustParsePrefix("64:ff9b::/96")
+	wrappedV4Ranges = []netip.Prefix{
+		netip.MustParsePrefix("64:ff9b:1::/48"),
+		netip.MustParsePrefix("2002::/16"),
+		netip.MustParsePrefix("2001::/32"),
+		netip.MustParsePrefix("::/96"),
 	}
-	return ip.IsGlobalUnicast() && !ip.IsPrivate() && !sharedAddressSpace.Contains(ip)
+	thisNetwork = netip.MustParsePrefix("0.0.0.0/8")
+)
+
+func isPublicIP(raw net.IP) bool {
+	ip, ok := netip.AddrFromSlice(raw)
+	if !ok {
+		return false
+	}
+	ip = ip.Unmap()
+	if nat64Prefix.Contains(ip) {
+		b := ip.As16()
+		return isPublicIP(net.IP(b[12:]))
+	}
+	for _, p := range wrappedV4Ranges {
+		if p.Contains(ip) {
+			return false
+		}
+	}
+	std := net.IP(ip.AsSlice())
+	return std.IsGlobalUnicast() && !std.IsPrivate() && !sharedAddressSpace.Contains(std) && !thisNetwork.Contains(ip)
 }
 
 func previewHTTPGet(ctx context.Context, rawURL string, limit int64) ([]byte, string, error) {
