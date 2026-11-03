@@ -1186,6 +1186,15 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 
 	timestamp = sanitizeTimestamp(timestamp, "message", id)
 
+	// Rows are keyed by (id, chat_jid) only, but WhatsApp's message key also
+	// carries the sender and direction, and a client chooses its own message
+	// IDs. Re-storing the same message (history sync, the echo of our own send)
+	// is normal; another sender reusing the ID must not replace the original.
+	if prevSender, prevFromMe, ok := store.messageAuthor(id, chatJID); ok && !sameAuthor(prevSender, prevFromMe, sender, isFromMe) {
+		slog.Info("ignored a message reusing another sender's message ID", "id", id, "chat", chatJID)
+		return nil
+	}
+
 	if !isPostgres {
 		_, err := store.db.Exec(
 			`INSERT OR REPLACE INTO messages
@@ -1222,7 +1231,10 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
     quoted_message_id = COALESCE(EXCLUDED.quoted_message_id, messages.quoted_message_id),
     quoted_sender = COALESCE(EXCLUDED.quoted_sender, messages.quoted_sender),
     quoted_content = COALESCE(EXCLUDED.quoted_content, messages.quoted_content),
-    is_forwarded = messages.is_forwarded OR EXCLUDED.is_forwarded`,
+    is_forwarded = messages.is_forwarded OR EXCLUDED.is_forwarded,
+    scan_status = CASE WHEN messages.file_sha256 IS DISTINCT FROM EXCLUDED.file_sha256 THEN NULL ELSE messages.scan_status END,
+    scan_reason = CASE WHEN messages.file_sha256 IS DISTINCT FROM EXCLUDED.file_sha256 THEN NULL ELSE messages.scan_reason END,
+    scanned_at = CASE WHEN messages.file_sha256 IS DISTINCT FROM EXCLUDED.file_sha256 THEN NULL ELSE messages.scanned_at END`,
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, nullable(quotedID), nullable(quotedSender), nullable(quotedContent), isForwarded, nullable(directPath),
 	)
 	if err == nil && mediaType != "" {
@@ -1230,6 +1242,32 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 	}
 
 	return err
+}
+
+// messageAuthor returns the stored sender and direction of a message, if any.
+func (store *MessageStore) messageAuthor(id, chatJID string) (string, bool, bool) {
+	q := `SELECT sender, is_from_me FROM messages WHERE id = ? AND chat_jid = ?`
+	if isPostgres {
+		q = `SELECT sender, is_from_me FROM messages WHERE id = $1 AND chat_jid = $2`
+	}
+	var sender sql.NullString
+	var fromMe bool
+	if store.db.QueryRow(q, id, chatJID).Scan(&sender, &fromMe) != nil {
+		return "", false, false
+	}
+	return sender.String, fromMe, true
+}
+
+// sameAuthor reports whether a re-stored message comes from the author of the
+// stored row. Our own messages are stored with different sender spellings
+// (the API send, the phone's echo, history sync), and only our own devices
+// can produce is_from_me, so direction alone decides those; for anyone else
+// the bare user part must match.
+func sameAuthor(prevSender string, prevFromMe bool, sender string, fromMe bool) bool {
+	if prevFromMe != fromMe {
+		return false
+	}
+	return fromMe || senderUser(prevSender) == senderUser(sender)
 }
 
 // recordPreScan stores the verdict a message arrives with. A copy of a file
@@ -5760,7 +5798,7 @@ func (store *MessageStore) FormatMessage(msg MessageInteraction, showChatInfo bo
 	ts := msg.Timestamp.Format("2006-01-02 15:04:05")
 
 	if showChatInfo && msg.ChatName != "" {
-		sb.WriteString(fmt.Sprintf("[%s] Chat: %s ", ts, msg.ChatName))
+		sb.WriteString(fmt.Sprintf("[%s] Chat: %s ", ts, oneLine(msg.ChatName)))
 	} else {
 		sb.WriteString(fmt.Sprintf("[%s] ", ts))
 	}
@@ -5784,7 +5822,7 @@ func (store *MessageStore) FormatMessage(msg MessageInteraction, showChatInfo bo
 		}
 	}
 
-	sb.WriteString(fmt.Sprintf("From: %s: %s%s\n", senderName, prefix, contactCardSummary(msg.Content)))
+	sb.WriteString(fmt.Sprintf("From: %s: %s%s\n", oneLine(senderName), prefix, frameContinuation(contactCardSummary(msg.Content))))
 
 	// A reply names the message it quotes, so a bare "received" can be tied to
 	// the exact card it answers.
@@ -5795,16 +5833,31 @@ func (store *MessageStore) FormatMessage(msg MessageInteraction, showChatInfo bo
 	// A flagged file says why before anyone downloads or opens it.
 	// Known malware says so in its reason; the marker is the same for every flag.
 	if msg.ScanStatus == scanMalware || msg.ScanStatus == scanSuspicious {
-		sb.WriteString("    ⤷ ⚠ flagged file: " + msg.ScanReason + "\n")
+		sb.WriteString("    ⤷ ⚠ flagged file: " + oneLine(msg.ScanReason) + "\n")
 	}
 
 	// Reactions on their own indented sub-line so they're clearly distinct from
 	// the message text (which may itself be long or contain brackets/pipes).
 	if rx := store.GetReactions(msg.ID); len(rx) > 0 {
-		sb.WriteString("    ⤷ reactions: " + strings.Join(rx, ", ") + "\n")
+		sb.WriteString("    ⤷ reactions: " + oneLine(strings.Join(rx, ", ")) + "\n")
 	}
 
 	return sb.String()
+}
+
+// Message text and names are written by other people, and this listing goes
+// to a model as plain text. A newline in a message must not be able to start
+// a line that looks like a real entry ("[ts] From: Me: ..."), so every
+// continuation line of a message is marked "    │ ", which no entry or
+// sub-line starts with, and names are kept to one line.
+var lineBreaks = strings.NewReplacer("\r\n", "\n", "\r", "\n", " ", "\n", " ", "\n", "\u0085", "\n", "\v", "\n", "\f", "\n")
+
+func frameContinuation(s string) string {
+	return strings.ReplaceAll(lineBreaks.Replace(s), "\n", "\n    │ ")
+}
+
+func oneLine(s string) string {
+	return strings.Join(strings.Fields(lineBreaks.Replace(s)), " ")
 }
 
 // formatQuoteLine renders the "replying to" sub-line: who wrote the quoted

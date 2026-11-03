@@ -855,6 +855,10 @@ func sendMediaHandler(
 		if !callerFilesReadable() {
 			return &mcp.CallToolResult{IsError: true}, map[string]any{"success": false, "error": "this server is remote and cannot read " + absPath + "; upload the file with upload_media and pass the returned url"}, nil
 		}
+		absPath, err = sendableMediaPath(absPath)
+		if err != nil {
+			return &mcp.CallToolResult{IsError: true}, map[string]any{"success": false, "error": err.Error()}, nil
+		}
 		data, rerr := os.ReadFile(absPath)
 		if rerr != nil {
 			return &mcp.CallToolResult{IsError: true}, map[string]any{"success": false, "error": fmt.Sprintf("failed to read file: %v", rerr)}, nil

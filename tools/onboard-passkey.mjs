@@ -13,6 +13,8 @@
 //            override with BRIDGE_URL. API key from WHATSAPP_API_KEY env or
 //            whatsapp-bridge/.env in this repo.)
 // In both cases: start phone-code pairing for the number first, then run this.
+// A link's server must be https and is confirmed in a dialog naming it, unless
+// listed in PASSKEY_TRUSTED_HOSTS (e.g. PASSKEY_TRUSTED_HOSTS=wa.example.com).
 import { spawn, execSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -61,6 +63,47 @@ const CHROME = detectBrowser();
 // Link code comes from PASSKEY_LINK env, OR from argv when launched as the
 // wapasskey:// protocol handler (the manager's "Link via passkey" button). The
 // OS passes the whole URL, e.g. "wapasskey://<code>/" — strip scheme + slashes.
+function trustedManagerOrigin(raw) {
+  let url;
+  try { url = new URL(String(raw)); } catch { refuse("the link does not name a valid server"); }
+  const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+  if (url.username || url.password) refuse("the link's server address carries credentials");
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) refuse(`the link points at ${url.origin}, which is not https`);
+  if (!/^[a-z0-9.-]+$|^\[::1\]$/i.test(url.hostname)) refuse("the link's server name is not a plain host name");
+  const trusted = (process.env.PASSKEY_TRUSTED_HOSTS || "").split(",").map((h) => h.trim().toLowerCase()).filter(Boolean);
+  if (!loopback && !trusted.includes(url.hostname.toLowerCase()) && !confirmHost(url.host)) {
+    refuse(`linking to ${url.host} was not confirmed`);
+  }
+  return url.origin;
+}
+
+// Asks in a native dialog, since a one-click launch has no console. Only Yes
+// continues; a missing dialog tool counts as No.
+function confirmHost(host) {
+  const msg = `Link a WhatsApp number using your phone's passkey, for the server ${host}?\n\n` +
+    `Only continue if you just clicked "Link via passkey" in your manager at ${host}. ` +
+    `If you did not, or the name looks wrong, choose No: whoever runs that server would get your WhatsApp.`;
+  try {
+    if (IS_WIN) {
+      const ps = `Add-Type -AssemblyName PresentationFramework; [System.Windows.MessageBox]::Show($env:PK_MSG, 'WhatsApp passkey link', 'YesNo', 'Warning', 'No')`;
+      return execSync(`powershell -NoProfile -NonInteractive -Command "${ps}"`, { env: { ...process.env, PK_MSG: msg }, stdio: ["ignore", "pipe", "ignore"] }).toString().trim() === "Yes";
+    }
+    if (IS_MAC) {
+      execSync(`osascript -e 'display dialog (system attribute "PK_MSG") buttons {"No", "Link"} default button "No" cancel button "No" with icon caution'`, { env: { ...process.env, PK_MSG: msg }, stdio: "ignore" });
+      return true;
+    }
+    execSync(`zenity --question --default-cancel --title="WhatsApp passkey link" --text="$PK_MSG"`, { env: { ...process.env, PK_MSG: msg }, stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function refuse(why) {
+  console.error(`Passkey link refused: ${why}.`);
+  process.exit(1);
+}
+
 function resolveLink() {
   if (process.env.PASSKEY_LINK) return process.env.PASSKEY_LINK;
   const arg = process.argv.slice(2).find((a) => a && a.trim());
@@ -71,7 +114,12 @@ const LINK = resolveLink();
 let BASE, PK, authHeader = null;
 if (LINK) {
   const { u, n, t } = JSON.parse(Buffer.from(LINK, "base64url").toString("utf8"));
-  BASE = `${String(u).replace(/\/+$/, "")}/api/admin/numbers/${n}/passkey`;
+  // The link names the server that receives the passkey approval, and any web
+  // page can open a wapasskey:// link. So the server must be https (or this
+  // machine), and the operator must confirm it by name before anything runs,
+  // unless it is listed in PASSKEY_TRUSTED_HOSTS (comma-separated host names).
+  const origin = trustedManagerOrigin(u);
+  BASE = `${origin}/api/admin/numbers/${encodeURIComponent(String(n))}/passkey`;
   PK = { request: "/request", response: "/response", code: "/code", confirm: "/confirm" };
   authHeader = `Bearer ${t}`;
 } else {
