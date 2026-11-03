@@ -4835,14 +4835,18 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 	serverAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	slog.Info("starting REST API server", "addr", serverAddr)
 
-	// Without timeouts a client that sends headers or reads the response one
-	// byte at a time holds a connection (and a goroutine) forever, so a handful
-	// of them can starve the API. WriteTimeout is left unset: /download and
-	// media sends stream large files and run longer than any fixed cap.
+	// Without these a client that trickles its headers, or holds an idle
+	// keep-alive, keeps a connection (and a goroutine) forever, so a handful of
+	// them can starve the API. Only the unauthenticated parts are bounded:
+	// headers must arrive within 10s, before the JWT check runs, and an idle
+	// connection is closed after 2m. ReadTimeout and WriteTimeout stay unset on
+	// purpose: ReadTimeout caps the time to receive the whole request body, so
+	// any fixed value would cut off a large base64 media send (up to ~135 MB of
+	// JSON) from a slow link, and WriteTimeout would do the same to /download
+	// streaming a large file to a slow reader.
 	srv := &http.Server{
 		Addr:              serverAddr,
 		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       5 * time.Minute, // whole body, incl. base64 media uploads
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    64 << 10,
 	}
