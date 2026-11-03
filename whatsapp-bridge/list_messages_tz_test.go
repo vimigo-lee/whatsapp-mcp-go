@@ -82,6 +82,7 @@ func checkBounds(t *testing.T, driver, dsn string) {
 			t.Fatal(err)
 		}
 	}
+	addDeletedAtColumn(t, db)
 
 	s := &MessageStore{db: db}
 	list := func(after, before string) string {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/binary"
@@ -525,6 +526,58 @@ func (store *MessageStore) DeleteMessage(chatJID, msgID string) error {
 	}
 	_, err := store.db.Exec(q, msgID, chatJID)
 	return err
+}
+
+// The message ID in an edit or revoke is chosen by whoever sends it, and the
+// payload is end-to-end encrypted, so the server cannot check it. Received
+// edits and revokes therefore only touch a row its author sent: the account's
+// own rows for its own devices (fromMe), otherwise rows whose sender is one of
+// senders (the normalized and raw forms, so a LID/phone mapping learned in
+// between still matches). They report whether a row changed.
+
+// UpdateOwnMessageContent applies a received edit to the author's own row.
+func (store *MessageStore) UpdateOwnMessageContent(chatJID, msgID string, fromMe bool, senders []string, content string) (bool, error) {
+	q, args := authorScopedUpdate("content = ?, edited_at = CURRENT_TIMESTAMP", "content = $1, edited_at = now()", chatJID, msgID, fromMe, senders)
+	return store.execChanged(q, append([]any{content}, args...)...)
+}
+
+// DeleteOwnMessage applies a received revoke to the author's own row.
+func (store *MessageStore) DeleteOwnMessage(chatJID, msgID string, fromMe bool, senders []string) (bool, error) {
+	q, args := authorScopedUpdate("deleted_at = CURRENT_TIMESTAMP", "deleted_at = now()", chatJID, msgID, fromMe, senders)
+	return store.execChanged(q, args...)
+}
+
+// authorScopedUpdate builds "UPDATE messages SET <set> WHERE id AND chat_jid
+// AND <author>"; the Postgres SET clause takes $1 when the caller prepends a
+// value, and the WHERE placeholders are numbered after it.
+func authorScopedUpdate(setSQLite, setPG, chatJID, msgID string, fromMe bool, senders []string) (string, []any) {
+	args := []any{msgID, chatJID, fromMe}
+	where := "id = ? AND chat_jid = ? AND is_from_me = ?"
+	if !fromMe && len(senders) == 0 {
+		where += " AND 1 = 0"
+	} else if !fromMe {
+		where += " AND sender IN (" + strings.TrimSuffix(strings.Repeat("?,", len(senders)), ",") + ")"
+		for _, s := range senders {
+			args = append(args, s)
+		}
+	}
+	if !isPostgres {
+		return "UPDATE messages SET " + setSQLite + " WHERE " + where, args
+	}
+	n := strings.Count(setPG, "$")
+	for i := range args {
+		where = strings.Replace(where, "?", fmt.Sprintf("$%d", n+i+1), 1)
+	}
+	return "UPDATE messages SET " + setPG + " WHERE " + where, args
+}
+
+func (store *MessageStore) execChanged(q string, args ...any) (bool, error) {
+	res, err := store.db.Exec(q, args...)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
 }
 
 // GetReactions returns "emoji (sender)" entries for a message, for display.
@@ -2451,6 +2504,27 @@ func handleGroupInfoEvent(client *whatsmeow.Client, evt *events.GroupInfo, logge
 	}()
 }
 
+// isGroupAdmin reports whether user is an admin of group, asking the server.
+// It runs only for a revoke of someone else's message, so the round trip is
+// rare; any error counts as "not an admin" and the revoke is ignored.
+// A variable so tests can answer without a server.
+var isGroupAdmin = func(client *whatsmeow.Client, group, user types.JID) bool {
+	if client == nil {
+		return false
+	}
+	info, err := client.GetGroupInfo(context.Background(), group)
+	if err != nil || info == nil {
+		return false
+	}
+	u := user.ToNonAD()
+	for _, p := range info.Participants {
+		if (p.IsAdmin || p.IsSuperAdmin) && (p.JID.ToNonAD() == u || p.LID.ToNonAD() == u || p.PhoneNumber.ToNonAD() == u) {
+			return true
+		}
+	}
+	return false
+}
+
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
 	chatJID := normalizeUserJID(client, msg.Info.Chat).String()
@@ -2528,10 +2602,23 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			target = k.GetID()
 		}
 		if target != "" {
+			// Only the author may change a row (see UpdateOwnMessageContent);
+			// in a group an admin may also delete someone else's message.
+			senders := []string{sender}
+			if raw := msg.Info.Sender.User; raw != "" && raw != sender {
+				senders = append(senders, raw)
+			}
 			switch pm.GetType() {
 			case waE2E.ProtocolMessage_REVOKE:
-				if err := messageStore.DeleteMessage(chatJID, target); err != nil {
+				changed, err := messageStore.DeleteOwnMessage(chatJID, target, msg.Info.IsFromMe, senders)
+				if err == nil && !changed && msg.Info.IsGroup && isGroupAdmin(client, msg.Info.Chat, msg.Info.Sender) {
+					err = messageStore.DeleteMessage(chatJID, target)
+					changed = err == nil
+				}
+				if err != nil {
 					logger.Warnf("Failed to delete revoked message: %v", err)
+				} else if !changed {
+					logger.Infof("Ignored revoke of %s in %s from %s: not the author or a group admin", target, chatJID, msg.Info.Sender)
 				}
 			case waE2E.ProtocolMessage_MESSAGE_EDIT:
 				edited := extractTextContent(pm.GetEditedMessage())
@@ -2539,8 +2626,11 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 					edited = captionOf(pm.GetEditedMessage())
 				}
 				if edited != "" {
-					if err := messageStore.UpdateMessageContent(chatJID, target, edited+" (edited)"); err != nil {
+					changed, err := messageStore.UpdateOwnMessageContent(chatJID, target, msg.Info.IsFromMe, senders, edited+" (edited)")
+					if err != nil {
 						logger.Warnf("Failed to apply message edit: %v", err)
+					} else if !changed {
+						logger.Infof("Ignored edit of %s in %s from %s: not the author", target, chatJID, msg.Info.Sender)
 					}
 				}
 			}
@@ -2859,8 +2949,32 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	return true, mediaType, filename, path, scan, nil
 }
 
+// storableChatJID reports whether a chat JID from history sync is one WhatsApp
+// actually uses. The chat JID later names the chat's media folder, so a value
+// like "x@/../../elsewhere" must never reach the store.
+func storableChatJID(jid types.JID) bool {
+	switch jid.Server {
+	case types.DefaultUserServer, types.GroupServer, types.HiddenUserServer, types.NewsletterServer, types.BroadcastServer:
+	default:
+		return false
+	}
+	return jid.User != "" && !strings.ContainsAny(jid.User, `/\`) && !strings.Contains(jid.User, "..")
+}
+
+// fileMatchesSHA256 reports whether data is the file a message's
+// WhatsApp-verified hash names. Rows from before hashes were stored have none;
+// their files are taken as they are, as before.
+func fileMatchesSHA256(data, want []byte) bool {
+	if len(want) != sha256.Size {
+		return true
+	}
+	sum := sha256.Sum256(data)
+	return bytes.Equal(sum[:], want)
+}
+
 // fetchMedia downloads a message's media to the chat's media folder (or finds
-// it already there). data holds the bytes when they were just downloaded.
+// it already there). data holds the bytes when they were just downloaded or
+// read back from disk.
 func fetchMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, []byte, error) {
 	var mediaType, filename, url string
 	var mediaKey, fileSHA256, fileEncSHA256 []byte
@@ -2894,17 +3008,8 @@ func fetchMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID,
 		return false, "", "", "", nil, fmt.Errorf("not a media message")
 	}
 
-	if err := os.MkdirAll(chatDir, 0755); err != nil {
-		return false, "", "", "", nil, fmt.Errorf("failed to create chat directory: %v", err)
-	}
-
-	// Rows stored before names were sanitized on arrival can still hold a
-	// sender's "../" path, so clean it again and refuse anything that would
-	// land outside the chat folder.
-	filename = safeMediaFilename(filename, mediaStem(mediaType, fileSHA256))
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
-
-	absPath, err := filepath.Abs(localPath)
+	// The chat JID names the folder, so it must stay a direct child of store/.
+	absStore, err := filepath.Abs("store")
 	if err != nil {
 		return false, "", "", "", nil, fmt.Errorf("failed to get absolute path: %v", err)
 	}
@@ -2912,12 +3017,36 @@ func fetchMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID,
 	if err != nil {
 		return false, "", "", "", nil, fmt.Errorf("failed to get absolute path: %v", err)
 	}
-	if filepath.Dir(absPath) != absChatDir {
-		return false, "", "", "", nil, fmt.Errorf("media filename escapes the chat folder: %q", filename)
+	if filepath.Dir(absChatDir) != absStore {
+		return false, "", "", "", nil, fmt.Errorf("chat folder escapes the store: %q", chatJID)
 	}
-
-	if _, err := os.Stat(localPath); err == nil {
-		return true, mediaType, filename, absPath, nil, nil
+	if err := os.MkdirAll(chatDir, 0755); err != nil {
+		return false, "", "", "", nil, fmt.Errorf("failed to create chat directory: %v", err)
+	}
+	// The file name comes from the sender (or a hash prefix a sender can copy),
+	// so a file already at that path may be another message's. Reuse it only
+	// when it is this message's file; otherwise this message gets its own
+	// hash-qualified name. Rows stored before names were sanitized on arrival
+	// can still hold a sender's "../" path, so every name is cleaned again and
+	// refused if it would land outside the chat folder.
+	stem := mediaStem(mediaType, fileSHA256)
+	var absPath string
+	for _, candidate := range []string{filename, stem + "_" + filename} {
+		filename = safeMediaFilename(candidate, stem)
+		localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+		if absPath, err = filepath.Abs(localPath); err != nil {
+			return false, "", "", "", nil, fmt.Errorf("failed to get absolute path: %v", err)
+		}
+		if filepath.Dir(absPath) != absChatDir {
+			return false, "", "", "", nil, fmt.Errorf("media filename escapes the chat folder: %q", filename)
+		}
+		existing, err := os.ReadFile(localPath)
+		if err != nil {
+			break // free name: download to it
+		}
+		if fileMatchesSHA256(existing, fileSHA256) {
+			return true, mediaType, filename, absPath, existing, nil
+		}
 	}
 
 	// Candidate CDN paths, best first: the stored direct path (the message's own,
@@ -4971,6 +5100,10 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			logger.Warnf("Failed to parse JID %s: %v", chatJID, err)
 			continue
 		}
+		if !storableChatJID(jid) {
+			logger.Warnf("Skipping history for unexpected chat JID %q", chatJID)
+			continue
+		}
 		jid = normalizeUserJID(client, jid)
 		chatJID = jid.String()
 
@@ -5586,60 +5719,25 @@ func placeholderWaveform(duration uint32) []byte {
 	return waveform
 }
 
+// GetSenderName resolves a sender to the name of their own chat. Senders are
+// stored as bare user digits, so look up that user's exact JIDs; a substring
+// match borrowed the name of any chat whose JID merely contained the digits
+// (sender 4791112345 showed as the contact at 447911123456).
 func (store *MessageStore) GetSenderName(senderJID string) string {
-	var name string
-	var err error
-
+	user := senderJID
+	if idx := strings.IndexAny(user, "@:"); idx > 0 {
+		user = user[:idx]
+	}
+	q := "SELECT name FROM chats WHERE jid = ? LIMIT 1"
 	if isPostgres {
-		err = store.db.QueryRow(
-			"SELECT name FROM chats WHERE jid = $1 LIMIT 1",
-			senderJID,
-		).Scan(&name)
-
-		if err == nil && name != "" {
+		q = "SELECT name FROM chats WHERE jid = $1 LIMIT 1"
+	}
+	for _, jid := range []string{senderJID, user + "@s.whatsapp.net", user + "@lid"} {
+		var name string
+		if err := store.db.QueryRow(q, jid).Scan(&name); err == nil && name != "" {
 			return name
 		}
-
-		phonePart := senderJID
-		if idx := strings.Index(senderJID, "@"); idx > 0 {
-			phonePart = senderJID[:idx]
-		}
-
-		err = store.db.QueryRow(
-			"SELECT name FROM chats WHERE jid LIKE $1 LIMIT 1",
-			"%"+phonePart+"%",
-		).Scan(&name)
-
-		if err == nil && name != "" {
-			return name
-		}
-
-		return senderJID
 	}
-
-	err = store.db.QueryRow(
-		"SELECT name FROM chats WHERE jid = ? LIMIT 1",
-		senderJID,
-	).Scan(&name)
-
-	if err == nil && name != "" {
-		return name
-	}
-
-	phonePart := senderJID
-	if idx := strings.Index(senderJID, "@"); idx > 0 {
-		phonePart = senderJID[:idx]
-	}
-
-	err = store.db.QueryRow(
-		"SELECT name FROM chats WHERE jid LIKE ? LIMIT 1",
-		"%"+phonePart+"%",
-	).Scan(&name)
-
-	if err == nil && name != "" {
-		return name
-	}
-
 	return senderJID
 }
 
@@ -5754,7 +5852,7 @@ func (store *MessageStore) ListMessages(s ListMessagesParams) (string, error) {
 
 	q := `
         SELECT 
-            m.timestamp, m.sender, c.name, m.content, m.is_from_me, 
+            m.timestamp, m.sender, c.name, CASE WHEN m.deleted_at IS NOT NULL THEN '[message deleted]' ELSE m.content END AS content, m.is_from_me, 
             c.jid, m.id, m.media_type,
             m.quoted_message_id, m.quoted_sender, m.quoted_content, m.scan_status, m.scan_reason
         FROM messages m
@@ -5992,7 +6090,7 @@ func (store *MessageStore) GetMessageContext(messageID string, before, after int
 
 	// --- Fetch the target message ---
 	q := `
-        SELECT m.timestamp, m.sender, c.name, m.content, m.is_from_me,
+        SELECT m.timestamp, m.sender, c.name, CASE WHEN m.deleted_at IS NOT NULL THEN '[message deleted]' ELSE m.content END AS content, m.is_from_me,
                c.jid, m.id, m.media_type, m.chat_jid,
                m.quoted_message_id, m.quoted_sender, m.quoted_content, m.scan_status, m.scan_reason
         FROM messages m
@@ -6039,7 +6137,7 @@ func (store *MessageStore) GetMessageContext(messageID string, before, after int
 	target.setScan(scanSt, scanRe)
 
 	qBefore := `
-        SELECT m.timestamp, m.sender, c.name, m.content, m.is_from_me,
+        SELECT m.timestamp, m.sender, c.name, CASE WHEN m.deleted_at IS NOT NULL THEN '[message deleted]' ELSE m.content END AS content, m.is_from_me,
                c.jid, m.id, m.media_type,
                m.quoted_message_id, m.quoted_sender, m.quoted_content, m.scan_status, m.scan_reason
         FROM messages m
@@ -6094,7 +6192,7 @@ func (store *MessageStore) GetMessageContext(messageID string, before, after int
 	}
 
 	qAfter := `
-        SELECT m.timestamp, m.sender, c.name, m.content, m.is_from_me,
+        SELECT m.timestamp, m.sender, c.name, CASE WHEN m.deleted_at IS NOT NULL THEN '[message deleted]' ELSE m.content END AS content, m.is_from_me,
                c.jid, m.id, m.media_type,
                m.quoted_message_id, m.quoted_sender, m.quoted_content, m.scan_status, m.scan_reason
         FROM messages m
@@ -6173,7 +6271,7 @@ func (store *MessageStore) ListChats(
 	q := `
         SELECT 
             c.jid, c.name, c.last_message_time, c.unread_count,
-            m.content AS last_message,
+            CASE WHEN m.deleted_at IS NOT NULL THEN '[message deleted]' ELSE m.content END AS last_message,
             m.sender AS last_sender,
             m.is_from_me AS last_is_from_me
         FROM chats c
@@ -6383,7 +6481,7 @@ func (store *MessageStore) GetContactChats(jid string, limit, page int) ([]Chat,
 	q := `
         SELECT DISTINCT
             c.jid, c.name, c.last_message_time, c.unread_count,
-            m.content AS last_message,
+            CASE WHEN m.deleted_at IS NOT NULL THEN '[message deleted]' ELSE m.content END AS last_message,
             m.sender AS last_sender,
             m.is_from_me AS last_is_from_me
         FROM chats c
@@ -6453,7 +6551,7 @@ func (store *MessageStore) GetLastInteraction(jid string) (string, error) {
 
 	q := `
         SELECT 
-            m.timestamp, m.sender, c.name, m.content, m.is_from_me,
+            m.timestamp, m.sender, c.name, CASE WHEN m.deleted_at IS NOT NULL THEN '[message deleted]' ELSE m.content END AS content, m.is_from_me,
             c.jid, m.id, m.media_type,
             m.quoted_message_id, m.quoted_sender, m.quoted_content, m.scan_status, m.scan_reason
         FROM messages m
@@ -6518,7 +6616,7 @@ func (store *MessageStore) GetChat(chatJID string, includeLastMessage bool) (*Ch
 	q := `
         SELECT 
             c.jid, c.name, c.last_message_time, c.unread_count,
-            m.content AS last_message,
+            CASE WHEN m.deleted_at IS NOT NULL THEN '[message deleted]' ELSE m.content END AS last_message,
             m.sender AS last_sender,
             m.is_from_me AS last_is_from_me
         FROM chats c
@@ -6585,7 +6683,7 @@ func (store *MessageStore) GetDirectChatByContact(phone string) (*Chat, error) {
 	q := `
        SELECT 
            c.jid, c.name, c.last_message_time, c.unread_count,
-           m.content AS last_message,
+           CASE WHEN m.deleted_at IS NOT NULL THEN '[message deleted]' ELSE m.content END AS last_message,
            m.sender AS last_sender,
            m.is_from_me AS last_is_from_me
        FROM chats c

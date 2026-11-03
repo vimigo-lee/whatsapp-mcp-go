@@ -27,6 +27,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -213,6 +214,14 @@ func handleHistoryReplay(client *whatsmeow.Client, store *MessageStore) http.Han
 				var notif waE2E.HistorySyncNotification
 				if n.ID == "" || protojson.Unmarshal(n.Notification, &notif) != nil {
 					respondError(w, http.StatusBadRequest, "each notification needs an id and a protojson HistorySyncNotification")
+					return
+				}
+				// whatsmeow uses an inline payload as the history itself instead of
+				// downloading it, so a caller could write any chats and messages
+				// into the store. Only accept notifications that point at the
+				// phone's upload on WhatsApp's media servers.
+				if notif.InitialHistBootstrapInlinePayload != nil || !strings.HasPrefix(notif.GetDirectPath(), "/") {
+					respondError(w, http.StatusBadRequest, "notification "+n.ID+" must point at a WhatsApp media upload (direct path, no inline payload)")
 					return
 				}
 				if err := storeHistoryNotification(store, n.ID, &notif); err != nil {

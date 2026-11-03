@@ -42,6 +42,7 @@ func TestListMessagesShowsQuotedMessage(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	addDeletedAtColumn(t, db)
 	s := &MessageStore{db: db}
 
 	chat := "120363@g.us"

@@ -50,7 +50,19 @@ func pdfReasons(data []byte) []string {
 		// malicious files are often broken on purpose, so fall back to bytes.
 		return append(reasons, pdfRawReasons(data)...)
 	}
-	return append(reasons, pdfObjectReasons(ctx)...)
+	return append(reasons, pdfObjectReasonsOrRaw(ctx, data)...)
+}
+
+// pdfObjectReasonsOrRaw walks the parsed objects. pdfcpu dereferences lazily,
+// so a hostile file can still panic after readPDF succeeded; fall back to the
+// byte checks then, as for a file that did not parse.
+func pdfObjectReasonsOrRaw(ctx *model.Context, data []byte) (reasons []string) {
+	defer func() {
+		if r := recover(); r != nil {
+			reasons = pdfRawReasons(data)
+		}
+	}()
+	return pdfObjectReasons(ctx)
 }
 
 // readPDF parses data into pdfcpu's object table. It never touches pdfcpu's
@@ -85,8 +97,27 @@ func pdfPasswordProtected(err error) bool {
 // document-level close/save/print events (WC, WS, DS, WP, DP).
 var pdfAutoTriggers = []string{"O", "PO", "PV", "WC", "WS", "DS", "WP", "DP"}
 
+// isJSValue reports whether an already dereferenced action runs JavaScript,
+// following /Next chains and action arrays through isJS.
+func isJSValue(o types.Object, depth int, isJS func(types.Object, int) bool) bool {
+	switch v := o.(type) {
+	case types.Dict:
+		if pdfName(v["S"]) == "JavaScript" {
+			return true
+		}
+		return v["Next"] != nil && isJS(v["Next"], depth+1)
+	case types.Array:
+		for _, e := range v {
+			if isJS(e, depth+1) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // pdfObjectReasons walks every object in the parsed file.
-func pdfObjectReasons(ctx *model.Context) []string {
+func pdfObjectReasons(ctx *model.Context) (reasons []string) {
 	xrt := ctx.XRefTable
 	deref := func(o types.Object) types.Object {
 		d, err := xrt.Dereference(o)
@@ -95,25 +126,27 @@ func pdfObjectReasons(ctx *model.Context) []string {
 		}
 		return d
 	}
+	// Each indirect object is judged once. Without the memo, an array whose
+	// elements refer back to itself fans out to N^9 calls, and a few hundred
+	// bytes keep a CPU busy for as long as the scan runs.
+	jsMemo := map[int]bool{}
 	var isJS func(o types.Object, depth int) bool
 	isJS = func(o types.Object, depth int) bool {
 		if depth > 8 {
 			return false
 		}
-		switch v := deref(o).(type) {
-		case types.Dict:
-			if pdfName(v["S"]) == "JavaScript" {
-				return true
-			}
-			return v["Next"] != nil && isJS(v["Next"], depth+1)
-		case types.Array:
-			for _, e := range v {
-				if isJS(e, depth+1) {
-					return true
-				}
-			}
+		ir, isRef := o.(types.IndirectRef)
+		if !isRef {
+			return isJSValue(deref(o), depth, isJS)
 		}
-		return false
+		nr := ir.ObjectNumber.Value()
+		if v, seen := jsMemo[nr]; seen {
+			return v
+		}
+		jsMemo[nr] = false // an object that refers back to itself is not JavaScript
+		v := isJSValue(deref(o), depth, isJS)
+		jsMemo[nr] = v
+		return v
 	}
 
 	autoJS, launch, disguised := false, false, false
@@ -194,7 +227,6 @@ func pdfObjectReasons(ctx *model.Context) []string {
 		}
 	}
 
-	var reasons []string
 	if autoJS {
 		reasons = append(reasons, reasonPDFAutoJS)
 	}

@@ -4,16 +4,19 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"image"
 	"image/jpeg"
 	_ "image/png"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"go.mau.fi/whatsmeow"
@@ -34,6 +37,11 @@ const (
 	linkPreviewPageBytes = 512 << 10
 	linkPreviewImageMax  = 4 << 20
 	linkPreviewThumbEdge = 400
+	// The byte cap alone does not bound decoding: a 48 KB PNG can declare
+	// 20000x20000 and make image.Decode allocate ~400 MB. 4096 per side and
+	// 4 MP is ample for a 400 px thumbnail and stays under ~32 MB decoded.
+	linkPreviewImageMaxSide   = 4096
+	linkPreviewImageMaxPixels = 4_000_000
 )
 
 var (
@@ -65,6 +73,53 @@ func isYouTubeHost(host string) bool {
 	return host == "youtube.com" || host == "youtu.be" || host == "music.youtube.com" || host == "youtube-nocookie.com"
 }
 
+// The link and the og:image it names come from whoever wrote the message, so
+// a preview must not become a way to read the bridge's own network (cloud
+// metadata, the database, other containers). The check runs on the address
+// actually dialed, after DNS and on every redirect, so a name that resolves to
+// a private address, or re-resolves to one, is refused too. No proxy: a proxy
+// would make the dialed address the proxy's.
+var previewClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy: nil,
+		DialContext: (&net.Dialer{
+			Timeout: linkPreviewTimeout,
+			Control: publicAddressOnly,
+		}).DialContext,
+		TLSHandshakeTimeout:   linkPreviewTimeout,
+		ResponseHeaderTimeout: linkPreviewTimeout,
+	},
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 5 {
+			return errors.New("too many redirects")
+		}
+		return nil
+	},
+}
+
+// sharedAddressSpace is 100.64.0.0/10 (carrier-grade NAT, Tailscale), which
+// IsPrivate does not cover.
+var sharedAddressSpace = &net.IPNet{IP: net.IPv4(100, 64, 0, 0), Mask: net.CIDRMask(10, 32)}
+
+func publicAddressOnly(network, address string, _ syscall.RawConn) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return err
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !isPublicIP(ip) {
+		return fmt.Errorf("refusing to fetch a preview from non-public address %s", host)
+	}
+	return nil
+}
+
+func isPublicIP(ip net.IP) bool {
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
+	return ip.IsGlobalUnicast() && !ip.IsPrivate() && !sharedAddressSpace.Contains(ip)
+}
+
 func previewHTTPGet(ctx context.Context, rawURL string, limit int64) ([]byte, string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
@@ -73,7 +128,7 @@ func previewHTTPGet(ctx context.Context, rawURL string, limit int64) ([]byte, st
 	// The crawler UA most sites already answer with Open Graph tags.
 	req.Header.Set("User-Agent", "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)")
 	req.Header.Set("Accept-Language", "en")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := previewClient.Do(req)
 	if err != nil {
 		return nil, "", err
 	}
@@ -172,6 +227,14 @@ func previewThumbnail(ctx context.Context, imageURL string) ([]byte, int, int, e
 	data, _, err := previewHTTPGet(ctx, imageURL, linkPreviewImageMax)
 	if err != nil {
 		return nil, 0, 0, err
+	}
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	if cfg.Width <= 0 || cfg.Height <= 0 || cfg.Width > linkPreviewImageMaxSide || cfg.Height > linkPreviewImageMaxSide ||
+		int64(cfg.Width)*int64(cfg.Height) > linkPreviewImageMaxPixels {
+		return nil, 0, 0, fmt.Errorf("preview image too large: %dx%d", cfg.Width, cfg.Height)
 	}
 	src, _, err := image.Decode(bytes.NewReader(data))
 	if err != nil {

@@ -43,6 +43,7 @@ func TestListMessagesContextSizesAndDedupe(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	addDeletedAtColumn(t, db)
 	s := &MessageStore{db: db}
 
 	chat, query := "120363@g.us", "invoice"

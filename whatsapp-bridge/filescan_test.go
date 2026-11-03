@@ -146,7 +146,7 @@ func TestScanVerdictInListMessages(t *testing.T) {
 		`CREATE TABLE messages (id TEXT, chat_jid TEXT, sender TEXT, content TEXT, timestamp TIMESTAMP,
 			is_from_me BOOLEAN, media_type TEXT, filename TEXT, url TEXT, media_key BLOB, file_sha256 BLOB,
 			file_enc_sha256 BLOB, file_length INTEGER, quoted_message_id TEXT, quoted_sender TEXT, quoted_content TEXT,
-			is_forwarded BOOLEAN, direct_path TEXT, scan_status TEXT, scan_reason TEXT, scanned_at TIMESTAMP,
+			is_forwarded BOOLEAN, direct_path TEXT, scan_status TEXT, scan_reason TEXT, scanned_at TIMESTAMP, deleted_at TIMESTAMP,
 			PRIMARY KEY (id, chat_jid))`,
 		`INSERT INTO chats VALUES ('120363@g.us', 'Finance', NULL)`,
 	} {
@@ -206,7 +206,7 @@ func TestFileVerdictSharedByCopies(t *testing.T) {
 	if _, err := db.Exec(`CREATE TABLE messages (id TEXT, chat_jid TEXT, sender TEXT, content TEXT, timestamp TIMESTAMP,
 		is_from_me BOOLEAN, media_type TEXT, filename TEXT, url TEXT, media_key BLOB, file_sha256 BLOB,
 		file_enc_sha256 BLOB, file_length INTEGER, quoted_message_id TEXT, quoted_sender TEXT, quoted_content TEXT,
-		is_forwarded BOOLEAN, direct_path TEXT, scan_status TEXT, scan_reason TEXT, scanned_at TIMESTAMP,
+		is_forwarded BOOLEAN, direct_path TEXT, scan_status TEXT, scan_reason TEXT, scanned_at TIMESTAMP, deleted_at TIMESTAMP,
 		PRIMARY KEY (id, chat_jid))`); err != nil {
 		t.Fatal(err)
 	}

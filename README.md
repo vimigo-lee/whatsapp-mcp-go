@@ -106,7 +106,7 @@ If you're running this project on Windows, be aware that `go-sqlite3` requires *
    ```bash
    cd whatsapp-bridge
    go env -w CGO_ENABLED=1
-   go run main.go # or use this to enabled webhook and http streaming, `WEBHOOK_URL=http://192.168.178.119:5777/sse IS_HTTP=true go run main.go`
+   go run main.go # or use this to enabled webhook and http streaming, `WEBHOOK_URL=http://localhost:5777/sse IS_HTTP=true go run main.go`
    ```
 
 ### Or run everything in Docker

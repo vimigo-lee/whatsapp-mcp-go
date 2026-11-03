@@ -3,7 +3,10 @@ package helpers
 import (
 	"encoding/json"
 	"log/slog"
+	"net/netip"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -11,13 +14,38 @@ import (
 
 var apiBaseURL = readApiBaseURL()
 
+// The bridge's API key travels with every call, so the default is the bridge
+// on this machine. The old default was a LAN address from someone's own
+// setup: anyone who left API_BASE_URL unset sent their key to whatever
+// answered there.
+const defaultAPIBaseURL = "http://localhost:8080/api"
+
 func readApiBaseURL() string {
-	if v := ReadEnv("API_BASE_URL", "http://192.168.178.119:30015/api"); v != "" {
-		return v
+	v := os.Getenv("API_BASE_URL")
+	if v == "" {
+		slog.Warn("API_BASE_URL not set, using the bridge on this machine", "url", defaultAPIBaseURL)
+		return defaultAPIBaseURL
 	}
-	const fallback = "http://localhost:8080/api"
-	slog.Warn("api_base_url not set, using default", "fallback", fallback)
-	return fallback
+	if plainHTTPOverPublicNetwork(v) {
+		slog.Warn("API_BASE_URL is plain http to a public host; the bridge API key is sent unencrypted. Use https or a private address.", "url", v)
+	}
+	return v
+}
+
+// plainHTTPOverPublicNetwork reports an http:// URL whose host is a public
+// IP or a dotted hostname. Loopback, private IPs and single-label names
+// (a Docker service such as wa-bridge) are treated as local.
+func plainHTTPOverPublicNetwork(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "http" {
+		return false
+	}
+	host := u.Hostname()
+	if ip, err := netip.ParseAddr(host); err == nil {
+		ip = ip.Unmap()
+		return !ip.IsLoopback() && !ip.IsPrivate() && !sharedAddressSpace.Contains(ip)
+	}
+	return host != "localhost" && strings.Contains(host, ".")
 }
 
 const apiTimeout = 60 * time.Second

@@ -19,6 +19,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -894,8 +895,7 @@ func sendMediaHandler(
 		if err != nil {
 			return &mcp.CallToolResult{IsError: true}, map[string]any{"success": false, "error": err.Error()}, nil
 		}
-		client := &http.Client{Timeout: apiTimeout}
-		resp, err := client.Do(httpReq)
+		resp, err := mediaURLClient.Do(httpReq)
 		if err != nil {
 			return &mcp.CallToolResult{IsError: true}, map[string]any{"success": false, "error": fmt.Sprintf("failed to fetch url: %v", err)}, nil
 		}
@@ -1005,6 +1005,41 @@ func mcpHTTPToken() (string, error) {
 // sharedAddressSpace is 100.64.0.0/10 (RFC 6598), used by carrier NAT and by
 // Tailscale; it is not reachable from the public internet.
 var sharedAddressSpace = netip.MustParsePrefix("100.64.0.0/10")
+
+// mediaURLClient fetches send_media's url. The url comes from the model, and
+// so from whatever text it was shown (a WhatsApp message, a web page), so it
+// must not reach the server's own network: cloud metadata, the bridge API,
+// a database, other containers. The check runs on the address actually
+// dialed, after DNS and on every redirect. No proxy, so the dialed address
+// is the target's. Local files go through media_path instead.
+var mediaURLClient = &http.Client{
+	Timeout: apiTimeout,
+	Transport: &http.Transport{
+		Proxy: nil,
+		DialContext: (&net.Dialer{
+			Timeout: apiTimeout,
+			Control: publicAddressOnly,
+		}).DialContext,
+		TLSHandshakeTimeout: apiTimeout,
+	},
+}
+
+func publicAddressOnly(_, address string, _ syscall.RawConn) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return err
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil || !isPublicAddr(ip) {
+		return fmt.Errorf("refusing to fetch media from non-public address %s", host)
+	}
+	return nil
+}
+
+func isPublicAddr(ip netip.Addr) bool {
+	ip = ip.Unmap()
+	return ip.IsGlobalUnicast() && !ip.IsPrivate() && !sharedAddressSpace.Contains(ip)
+}
 
 // privateNetworkOnly serves only peers on loopback or a private network
 // (Docker networks, the LAN, a tailnet) and refuses public addresses. It is the
