@@ -180,7 +180,7 @@ func TestScanVerdictInListMessages(t *testing.T) {
 	if err := s.SaveFileScan("OK1", chat, FileScan{Status: scanSuspicious, Reason: "PDF runs JavaScript when opened"}); err != nil {
 		t.Fatal(err)
 	}
-	s.recordPreScan("OK1", chat, FileScan{Status: scanSuspicious, Reason: "should not overwrite"})
+	s.recordPreScan("OK1", chat, nil, FileScan{Status: scanSuspicious, Reason: "should not overwrite"})
 	got, fromBytes := s.GetFileScan("OK1", chat)
 	if !fromBytes || got.Reason != "PDF runs JavaScript when opened" || got.SHA256 != "09" {
 		t.Errorf("GetFileScan = %+v fromBytes=%v", got, fromBytes)
@@ -188,5 +188,54 @@ func TestScanVerdictInListMessages(t *testing.T) {
 	out, _ = s.ListMessages(ListMessagesParams{ChatJid: &chat, Limit: 10})
 	if !strings.Contains(out, "⤷ ⚠ flagged file: PDF runs JavaScript when opened") {
 		t.Errorf("byte-scan flag missing:\n%s", out)
+	}
+}
+
+// One file forwarded into several chats is one verdict: checking any copy
+// flags the copies already stored, and a copy arriving later inherits it.
+func TestFileVerdictSharedByCopies(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	prevPG := isPostgres
+	isPostgres = false
+	defer func() { isPostgres = prevPG }()
+	if _, err := db.Exec(`CREATE TABLE messages (id TEXT, chat_jid TEXT, sender TEXT, content TEXT, timestamp TIMESTAMP,
+		is_from_me BOOLEAN, media_type TEXT, filename TEXT, url TEXT, media_key BLOB, file_sha256 BLOB,
+		file_enc_sha256 BLOB, file_length INTEGER, quoted_message_id TEXT, quoted_sender TEXT, quoted_content TEXT,
+		is_forwarded BOOLEAN, direct_path TEXT, scan_status TEXT, scan_reason TEXT, scanned_at TIMESTAMP,
+		PRIMARY KEY (id, chat_jid))`); err != nil {
+		t.Fatal(err)
+	}
+	s := &MessageStore{db: db}
+	zip := []byte{0xd0, 0x7b, 0xc1}
+	at := time.Date(2026, 11, 3, 8, 0, 0, 0, time.UTC)
+	store := func(id, chat string, sha []byte) {
+		t.Helper()
+		if err := s.StoreMessage(id, chat, "60123456789", "", at, false, "document", "TEST-INVOIS.zip", "", "", []byte{1}, sha, []byte{1}, 10, "", "", "", false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store("A", "1@s.whatsapp.net", zip)
+	store("B", "2@s.whatsapp.net", zip)
+	store("OTHER", "2@s.whatsapp.net", []byte{9})
+
+	verdict := FileScan{Status: scanSuspicious, Reason: "zip contains disk image TEST-INVOIS.vhd, a common way to hide malware", SHA256: hex.EncodeToString(zip)}
+	if err := s.SaveFileScan("A", "1@s.whatsapp.net", verdict); err != nil {
+		t.Fatal(err)
+	}
+	if got, fromBytes := s.GetFileScan("B", "2@s.whatsapp.net"); got.Status != scanSuspicious || got.Reason != verdict.Reason || !fromBytes {
+		t.Errorf("existing copy = %+v fromBytes=%v, want the shared verdict", got, fromBytes)
+	}
+	if got, _ := s.GetFileScan("OTHER", "2@s.whatsapp.net"); got.Status != "" {
+		t.Errorf("a different file picked up the verdict: %+v", got)
+	}
+
+	store("C", "3@s.whatsapp.net", zip)
+	if got, fromBytes := s.GetFileScan("C", "3@s.whatsapp.net"); got.Status != scanSuspicious || !fromBytes {
+		t.Errorf("later copy = %+v fromBytes=%v, want the shared verdict", got, fromBytes)
 	}
 }

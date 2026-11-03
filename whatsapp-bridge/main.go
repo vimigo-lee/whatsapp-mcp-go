@@ -451,6 +451,19 @@ func NewMessageStore() (*MessageStore, error) {
 		_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN scanned_at TIMESTAMP`)
 	}
 
+	// Copies of one file share its verdict by file_sha256 (recordPreScan,
+	// SaveFileScan). On Postgres the index is built CONCURRENTLY in the
+	// background so a big store never holds up startup or blocks inserts.
+	if isPostgres {
+		go func() {
+			if _, err := db.Exec(`CREATE INDEX CONCURRENTLY IF NOT EXISTS messages_file_sha256_idx ON messages (file_sha256) WHERE file_sha256 IS NOT NULL`); err != nil {
+				slog.Warn("could not create file_sha256 index", "error", err)
+			}
+		}()
+	} else {
+		_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS messages_file_sha256_idx ON messages (file_sha256)`)
+	}
+
 	return &MessageStore{db: db}, nil
 }
 
@@ -1128,7 +1141,7 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 			id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, nullable(quotedID), nullable(quotedSender), nullable(quotedContent), isForwarded, nullable(directPath),
 		)
 		if err == nil && mediaType != "" {
-			store.recordPreScan(id, chatJID, preScanFile(mediaType, filename, fileSHA256))
+			store.recordPreScan(id, chatJID, fileSHA256, preScanFile(mediaType, filename, fileSHA256))
 		}
 		return err
 	}
@@ -1160,15 +1173,37 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, nullable(quotedID), nullable(quotedSender), nullable(quotedContent), isForwarded, nullable(directPath),
 	)
 	if err == nil && mediaType != "" {
-		store.recordPreScan(id, chatJID, preScanFile(mediaType, filename, fileSHA256))
+		store.recordPreScan(id, chatJID, fileSHA256, preScanFile(mediaType, filename, fileSHA256))
 	}
 
 	return err
 }
 
-// recordPreScan stores the name/hash verdict a message arrives with. It never
-// overwrites a verdict from the downloaded bytes (scanned_at set).
-func (store *MessageStore) recordPreScan(id, chatJID string, s FileScan) {
+// recordPreScan stores the verdict a message arrives with. A copy of a file
+// whose bytes were already checked (same file_sha256, e.g. a forwarded zip)
+// takes that verdict outright; otherwise the name/hash verdict is kept. It
+// never overwrites a verdict from the downloaded bytes (scanned_at set).
+func (store *MessageStore) recordPreScan(id, chatJID string, fileSHA256 []byte, s FileScan) {
+	if len(fileSHA256) > 0 {
+		q := `SELECT scan_status, scan_reason, scanned_at FROM messages
+			WHERE file_sha256 = ? AND scanned_at IS NOT NULL AND NOT (id = ? AND chat_jid = ?) LIMIT 1`
+		if isPostgres {
+			q = `SELECT scan_status, scan_reason, scanned_at FROM messages
+			WHERE file_sha256 = $1 AND scanned_at IS NOT NULL AND NOT (id = $2 AND chat_jid = $3) LIMIT 1`
+		}
+		var status, reason sql.NullString
+		var at time.Time
+		if store.db.QueryRow(q, fileSHA256, id, chatJID).Scan(&status, &reason, &at) == nil {
+			u := `UPDATE messages SET scan_status = ?, scan_reason = ?, scanned_at = ? WHERE id = ? AND chat_jid = ? AND scanned_at IS NULL`
+			if isPostgres {
+				u = `UPDATE messages SET scan_status = $1, scan_reason = $2, scanned_at = $3 WHERE id = $4 AND chat_jid = $5 AND scanned_at IS NULL`
+			}
+			if _, err := store.db.Exec(u, status, reason, at, id, chatJID); err != nil {
+				slog.Warn("failed to copy file verdict", "message_id", id, "error", err)
+			}
+			return
+		}
+	}
 	if s.Status == "" {
 		return
 	}
@@ -1181,14 +1216,30 @@ func (store *MessageStore) recordPreScan(id, chatJID string, s FileScan) {
 	}
 }
 
-// SaveFileScan stores the verdict from a downloaded file's bytes.
+// SaveFileScan stores the verdict from a downloaded file's bytes, and gives
+// it to every other copy of the same file (same file_sha256) not yet checked,
+// so a zip forwarded into five chats is flagged in all five.
 func (store *MessageStore) SaveFileScan(id, chatJID string, s FileScan) error {
+	now := time.Now()
 	q := `UPDATE messages SET scan_status = ?, scan_reason = ?, scanned_at = ? WHERE id = ? AND chat_jid = ?`
 	if isPostgres {
 		q = `UPDATE messages SET scan_status = $1, scan_reason = $2, scanned_at = $3 WHERE id = $4 AND chat_jid = $5`
 	}
-	_, err := store.db.Exec(q, s.Status, nullable(s.Reason), time.Now(), id, chatJID)
-	return err
+	if _, err := store.db.Exec(q, s.Status, nullable(s.Reason), now, id, chatJID); err != nil {
+		return err
+	}
+	sha, err := hex.DecodeString(s.SHA256)
+	if err != nil || len(sha) == 0 {
+		return nil
+	}
+	q = `UPDATE messages SET scan_status = ?, scan_reason = ?, scanned_at = ? WHERE file_sha256 = ? AND scanned_at IS NULL`
+	if isPostgres {
+		q = `UPDATE messages SET scan_status = $1, scan_reason = $2, scanned_at = $3 WHERE file_sha256 = $4 AND scanned_at IS NULL`
+	}
+	if _, err := store.db.Exec(q, s.Status, nullable(s.Reason), now, sha); err != nil {
+		slog.Warn("failed to share file verdict with copies", "message_id", id, "error", err)
+	}
+	return nil
 }
 
 // GetFileScan returns a message's stored verdict and whether it came from the
