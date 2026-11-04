@@ -5880,11 +5880,30 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 		return 0, nil, fmt.Errorf("not a valid Ogg file (missing OggS signature)")
 	}
 
-	// Parse Ogg pages to find the last page with a valid granule position.
 	// Opus granule positions always count 48 kHz samples (RFC 7845 §4).
+	//
+	// A file may chain several logical streams back to back (TTS output
+	// generated a sentence at a time and appended, or `cat a.ogg b.ogg`). Each
+	// stream starts with a BOS page and its own OpusHead, and its granule
+	// position restarts from zero, so the last page alone measures only the
+	// last stream. Each stream's length (its last granule minus its own
+	// pre-skip) is summed instead. Pages are grouped by serial number, and a
+	// BOS page starts a new stream even when it reuses a serial. Grouping by
+	// serial (rather than "serial changed") keeps interleaved streams, such as
+	// a skeleton track, from being split into many fragments; only streams
+	// that carry an OpusHead are counted when any does.
+	//
+	// A granule of -1 (all bits set) means no packet ends on that page and
+	// carries no position, so it is skipped like 0.
 	const opusGranuleRate = 48000
-	var lastGranule uint64
-	var preSkip uint16 = 0
+	const noGranule = ^uint64(0)
+	type oggStream struct {
+		preSkip uint16
+		last    uint64
+		opus    bool
+	}
+	var streams []*oggStream
+	bySerial := map[uint32]*oggStream{}
 	var foundOpusHead bool
 
 	for i := 0; i < len(data); {
@@ -5897,7 +5916,9 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 			continue
 		}
 
+		headerType := data[i+5]
 		granulePos := binary.LittleEndian.Uint64(data[i+6 : i+14])
+		serial := binary.LittleEndian.Uint32(data[i+14 : i+18])
 		pageSeqNum := binary.LittleEndian.Uint32(data[i+18 : i+22])
 		numSegments := int(data[i+26])
 
@@ -5911,17 +5932,27 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 			pageSize += int(segLen)
 		}
 
-		if !foundOpusHead && pageSeqNum <= 1 && i+pageSize <= len(data) {
-			// The OpusHead fields sit at fixed offsets after the magic.
+		// headerType bit 0x02 marks the first page of a logical stream (BOS).
+		s := bySerial[serial]
+		if s == nil || headerType&0x02 != 0 {
+			s = &oggStream{}
+			streams = append(streams, s)
+			bySerial[serial] = s
+		}
+
+		if pageSeqNum <= 1 && i+pageSize <= len(data) {
+			// The OpusHead fields sit at fixed offsets after the magic. Each
+			// chained stream carries its own, with its own pre-skip.
 			if ps, rate, ok := opusHead(data[i : i+pageSize]); ok {
-				preSkip = ps
+				s.preSkip = ps
+				s.opus = true
 				foundOpusHead = true
-				slog.Info("found OpusHead", "input_sample_rate", rate, "pre_skip", preSkip)
+				slog.Info("found OpusHead", "input_sample_rate", rate, "pre_skip", ps, "stream", len(streams))
 			}
 		}
 
-		if granulePos != 0 {
-			lastGranule = granulePos
+		if granulePos != 0 && granulePos != noGranule {
+			s.last = granulePos
 		}
 
 		i += pageSize
@@ -5931,10 +5962,17 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 		slog.Warn("opushead not found, using default values")
 	}
 
-	if lastGranule > uint64(preSkip) {
-		durationSeconds := float64(lastGranule-uint64(preSkip)) / opusGranuleRate
+	var totalSamples uint64
+	for _, s := range streams {
+		if (s.opus || !foundOpusHead) && s.last > uint64(s.preSkip) {
+			totalSamples += s.last - uint64(s.preSkip)
+		}
+	}
+
+	if totalSamples > 0 {
+		durationSeconds := float64(totalSamples) / opusGranuleRate
 		duration = uint32(math.Ceil(durationSeconds))
-		slog.Info("calculated Opus duration from granule", "duration_seconds", durationSeconds, "last_granule", lastGranule)
+		slog.Info("calculated Opus duration from granule", "duration_seconds", durationSeconds, "streams", len(streams))
 	} else {
 		slog.Warn("no valid granule position found, using estimation")
 		durationEstimate := float64(len(data)) / 2000.0
