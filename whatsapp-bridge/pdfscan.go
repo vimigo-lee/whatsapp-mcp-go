@@ -39,6 +39,7 @@ func pdfReasons(data []byte) []string {
 	if len(data) > pdfMaxParseBytes {
 		return append(reasons, pdfRawReasons(data)...)
 	}
+	deadline := time.Now().Add(pdfParseTimeout)
 	ctx, err := readPDF(data)
 	if err != nil {
 		if pdfPasswordProtected(err) {
@@ -50,19 +51,29 @@ func pdfReasons(data []byte) []string {
 		// malicious files are often broken on purpose, so fall back to bytes.
 		return append(reasons, pdfRawReasons(data)...)
 	}
-	return append(reasons, pdfObjectReasonsOrRaw(ctx, data)...)
+	return append(reasons, pdfObjectReasonsOrRaw(ctx, data, deadline)...)
 }
+
+// pdfMaxWalkDecodeBytes caps what the object walk decompresses in total: a
+// few KB of nested Flate can expand to 64 MiB per object stream, and a file
+// can hold thousands of them.
+const pdfMaxWalkDecodeBytes = 64 << 20
 
 // pdfObjectReasonsOrRaw walks the parsed objects. pdfcpu dereferences lazily,
 // so a hostile file can still panic after readPDF succeeded; fall back to the
-// byte checks then, as for a file that did not parse.
-func pdfObjectReasonsOrRaw(ctx *model.Context, data []byte) (reasons []string) {
+// byte checks then, as for a file that did not parse, and also when the walk
+// ran out of time or decode budget before seeing every object.
+func pdfObjectReasonsOrRaw(ctx *model.Context, data []byte, deadline time.Time) (reasons []string) {
 	defer func() {
 		if r := recover(); r != nil {
 			reasons = pdfRawReasons(data)
 		}
 	}()
-	return pdfObjectReasons(ctx)
+	reasons, limited := pdfObjectReasons(ctx, deadline)
+	if limited {
+		reasons = append(reasons, pdfRawReasons(data)...)
+	}
+	return reasons
 }
 
 // readPDF parses data into pdfcpu's object table. It never touches pdfcpu's
@@ -116,8 +127,11 @@ func isJSValue(o types.Object, depth int, isJS func(types.Object, int) bool) boo
 	return false
 }
 
-// pdfObjectReasons walks every object in the parsed file.
-func pdfObjectReasons(ctx *model.Context) (reasons []string) {
+// pdfObjectReasons walks every object in the parsed file, until deadline or
+// until pdfMaxWalkDecodeBytes have been decompressed; limited reports that it
+// stopped early.
+func pdfObjectReasons(ctx *model.Context, deadline time.Time) (reasons []string, limited bool) {
+	var decoded int64
 	xrt := ctx.XRefTable
 	deref := func(o types.Object) types.Object {
 		d, err := xrt.Dereference(o)
@@ -205,11 +219,16 @@ func pdfObjectReasons(ctx *model.Context) (reasons []string) {
 		case types.ObjectStreamDict:
 			// The unpacked stream text keeps the names as written, so
 			// disguised keywords inside compressed sections show up here.
-			// pdfcpu unpacks lazily; decode a copy, capped like the parse.
+			// pdfcpu unpacks lazily; decode a copy, within the walk's budget.
+			if limited || decoded >= pdfMaxWalkDecodeBytes || time.Now().After(deadline) {
+				limited = true
+				return
+			}
 			sd := v.StreamDict
 			if sd.Content == nil {
-				_ = sd.DecodeWithLimit(pdfMaxParseBytes)
+				_ = sd.DecodeWithLimit(pdfMaxWalkDecodeBytes - decoded)
 			}
+			decoded += int64(len(sd.Content))
 			if pdfHasDisguisedNames(sd.Content) {
 				disguised = true
 			}
@@ -224,6 +243,10 @@ func pdfObjectReasons(ctx *model.Context) (reasons []string) {
 	for nr, entry := range xrt.Table {
 		if entry == nil || entry.Free {
 			continue
+		}
+		if limited || time.Now().After(deadline) {
+			limited = true
+			break
 		}
 		gen := 0
 		if entry.Generation != nil {
@@ -243,7 +266,7 @@ func pdfObjectReasons(ctx *model.Context) (reasons []string) {
 	if disguised {
 		reasons = append(reasons, reasonPDFDisguise)
 	}
-	return reasons
+	return reasons, limited
 }
 
 // pdfDocumentExtensions are launch targets that only open another document.

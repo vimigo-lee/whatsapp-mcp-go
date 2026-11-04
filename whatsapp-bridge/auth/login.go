@@ -26,17 +26,20 @@ func LoginHandler(cfg *config.Config) http.HandlerFunc {
 		// the existing LoginHandler signature stable avoids a wider refactor in this PR.
 		slog.Error("invalid AUTH_LOGIN_RATE", "err", err)
 		return func(w http.ResponseWriter, r *http.Request) {
-			http.Error(w, "server misconfigured", http.StatusInternalServerError)
+			reject(w, "server misconfigured", http.StatusInternalServerError)
 		}
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Login takes no body, so a peer that announces one and never sends it
+		// is cut off instead of holding the connection (see reject).
+		_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(preAuthReadTimeout))
 		ip := clientIP(r)
 		lim := limiter.get(ip)
 		if !lim.Allow() {
 			retry := retryAfterSeconds(lim)
 			w.Header().Set("Retry-After", strconv.Itoa(retry))
 			slog.Warn("login rate-limited", "remote", ip)
-			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+			reject(w, "Too Many Requests", http.StatusTooManyRequests)
 			return
 		}
 		expected := []byte("Bearer " + cfg.APIKey)
@@ -44,7 +47,7 @@ func LoginHandler(cfg *config.Config) http.HandlerFunc {
 
 		if subtle.ConstantTimeCompare(expected, got) != 1 {
 			slog.Warn("login rejected: bad api key", "remote", r.RemoteAddr)
-			http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+			reject(w, "Invalid credentials", http.StatusUnauthorized)
 			return
 		}
 
@@ -73,9 +76,13 @@ func LoginHandler(cfg *config.Config) http.HandlerFunc {
 // JwtAuthMiddleware Protect normal API endpoints
 func JwtAuthMiddleware(cfg *config.Config, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Until the token checks out the peer is unauthenticated: its request
+		// body gets a deadline, lifted below for large authenticated uploads.
+		rc := http.NewResponseController(w)
+		_ = rc.SetReadDeadline(time.Now().Add(preAuthReadTimeout))
 		auth := r.Header.Get("Authorization")
 		if !strings.HasPrefix(auth, "Bearer ") {
-			http.Error(w, "Missing or invalid Authorization header", http.StatusUnauthorized)
+			reject(w, "Missing or invalid Authorization header", http.StatusUnauthorized)
 			return
 		}
 
@@ -90,20 +97,35 @@ func JwtAuthMiddleware(cfg *config.Config, next http.Handler) http.Handler {
 			jwt.WithIssuer("whatsapp-bridge"),
 			jwt.WithAudience("whatsapp-mcp-server"),
 			jwt.WithValidMethods([]string{"HS256"}),
+			jwt.WithExpirationRequired(),
 		)
 
 		if err != nil {
 			slog.Warn("jwt parse error", "err", err, "remote", r.RemoteAddr)
-			http.Error(w, "Invalid or expired token", http.StatusUnauthorized)
+			reject(w, "Invalid or expired token", http.StatusUnauthorized)
 			return
 		}
 
 		if !token.Valid {
 			slog.Warn("jwt invalid", "remote", r.RemoteAddr)
-			http.Error(w, "Invalid or expired token", http.StatusUnauthorized)
+			reject(w, "Invalid or expired token", http.StatusUnauthorized)
 			return
 		}
 
+		_ = rc.SetReadDeadline(time.Time{})
 		next.ServeHTTP(w, r)
 	})
+}
+
+// preAuthReadTimeout bounds how long an unauthenticated request may take to
+// arrive in full.
+const preAuthReadTimeout = 10 * time.Second
+
+// reject answers a request refused before authentication and closes the
+// connection. Without Connection: close, net/http first drains the request
+// body the client announced, with no deadline, so a peer that never sends it
+// would hold the connection open indefinitely.
+func reject(w http.ResponseWriter, msg string, code int) {
+	w.Header().Set("Connection", "close")
+	http.Error(w, msg, code)
 }

@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	_ "time/tzdata" // embed the IANA zoneinfo DB so BRIDGE_TZ works on bare alpine
@@ -213,8 +214,10 @@ func openDatabase(dbName string) (*sql.DB, error) {
 
 	// Fallback to SQLite
 	log.Println("Connecting to sqlite3")
+	// mattn/go-sqlite3 reads _busy_timeout and _journal_mode; the _pragma=...
+	// form belongs to another driver and was silently ignored.
 	return sql.Open("sqlite3",
-		"file:store/messages.db?_foreign_keys=on&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
+		"file:store/messages.db?_foreign_keys=on&_busy_timeout=5000&_journal_mode=WAL")
 }
 
 // validateMediaPath sanitize media path
@@ -360,6 +363,19 @@ func NewMessageStore() (*MessageStore, error) {
 			jid TEXT PRIMARY KEY,
 			username TEXT NOT NULL
 		);
+
+		-- A revoke can arrive before the message it deletes (pairing history is
+		-- still downloading). It is kept here, with its author, and applied when
+		-- that message is stored.
+		CREATE TABLE IF NOT EXISTS pending_revokes (
+			id TEXT,
+			chat_jid TEXT,
+			is_from_me BOOLEAN NOT NULL,
+			senders TEXT NOT NULL,
+			revoked_at TIMESTAMP NOT NULL,
+			PRIMARY KEY (id, chat_jid, is_from_me, senders)
+		);
+		CREATE INDEX IF NOT EXISTS pending_revokes_revoked_at_idx ON pending_revokes (revoked_at);
 	`, blobType, blobType, blobType))
 	if err != nil {
 		db.Close()
@@ -717,26 +733,51 @@ func normalizeUserJID(client *whatsmeow.Client, jid types.JID) types.JID {
 // messages only in the @lid chat move; the @lid copies left are duplicates
 // and go. Business labels and reactions follow the chat.
 func moveLIDChatRows(tx *sql.Tx, isPostgresDB bool, lidJID, pnJID string) error {
+	// Message IDs are chosen by the sender, so a row in one chat and a row with
+	// the same ID in the other are the same message only when they have the same
+	// author: both ours, or both from this contact under either spelling. Only
+	// such copies hand over a revoke or an edit, or are dropped as duplicates.
+	users := []any{strings.TrimSuffix(lidJID, "@lid"), strings.Split(pnJID, "@")[0]}
+	same := func(a, b string) string {
+		return a + ".is_from_me = " + b + ".is_from_me AND (" + b + ".is_from_me OR (" +
+			a + ".sender IN (?, ?) AND " + b + ".sender IN (?, ?)))"
+	}
+	sameArgs := append(append([]any{}, users...), users...)
+	with := func(args ...any) []any {
+		var out []any
+		for _, a := range args {
+			if a == nil {
+				out = append(out, sameArgs...)
+			} else {
+				out = append(out, a)
+			}
+		}
+		return out
+	}
 	steps := []struct {
 		q    string
 		args []any
 	}{
 		// A revoke on either copy wins.
-		{`UPDATE messages SET deleted_at = (SELECT l.deleted_at FROM messages l WHERE l.chat_jid = ? AND l.id = messages.id)
+		{`UPDATE messages SET deleted_at = (SELECT l.deleted_at FROM messages l WHERE l.chat_jid = ? AND l.id = messages.id AND ` + same("l", "messages") + `)
 			WHERE chat_jid = ? AND deleted_at IS NULL
-			AND id IN (SELECT id FROM messages WHERE chat_jid = ? AND deleted_at IS NOT NULL)`,
-			[]any{lidJID, pnJID, lidJID}},
+			AND EXISTS (SELECT 1 FROM messages l WHERE l.chat_jid = ? AND l.id = messages.id AND l.deleted_at IS NOT NULL AND ` + same("l", "messages") + `)`,
+			with(lidJID, nil, pnJID, lidJID, nil)},
 		// The later edit wins.
 		{`UPDATE messages SET
-				content = (SELECT l.content FROM messages l WHERE l.chat_jid = ? AND l.id = messages.id),
-				edited_at = (SELECT l.edited_at FROM messages l WHERE l.chat_jid = ? AND l.id = messages.id)
-			WHERE chat_jid = ? AND id IN (
-				SELECT l.id FROM messages l WHERE l.chat_jid = ? AND l.edited_at IS NOT NULL
-				AND (messages.edited_at IS NULL OR l.edited_at > messages.edited_at))`,
-			[]any{lidJID, lidJID, pnJID, lidJID}},
+				content = (SELECT l.content FROM messages l WHERE l.chat_jid = ? AND l.id = messages.id AND ` + same("l", "messages") + `),
+				edited_at = (SELECT l.edited_at FROM messages l WHERE l.chat_jid = ? AND l.id = messages.id AND ` + same("l", "messages") + `)
+			WHERE chat_jid = ? AND EXISTS (
+				SELECT 1 FROM messages l WHERE l.chat_jid = ? AND l.id = messages.id AND l.edited_at IS NOT NULL
+				AND (messages.edited_at IS NULL OR l.edited_at > messages.edited_at) AND ` + same("l", "messages") + `)`,
+			with(lidJID, nil, lidJID, nil, pnJID, lidJID, nil)},
 		{`UPDATE messages SET chat_jid = ? WHERE chat_jid = ? AND id NOT IN (SELECT id FROM messages WHERE chat_jid = ?)`,
 			[]any{pnJID, lidJID, pnJID}},
-		{`DELETE FROM messages WHERE chat_jid = ?`, []any{lidJID}},
+		// A row whose ID belongs to another author's message in the phone chat
+		// stays where it is (with its chat), rather than being lost or merged.
+		{`DELETE FROM messages WHERE chat_jid = ? AND EXISTS (
+				SELECT 1 FROM messages p WHERE p.chat_jid = ? AND p.id = messages.id AND ` + same("messages", "p") + `)`,
+			with(lidJID, pnJID, nil)},
 		{`UPDATE reactions SET chat_jid = ? WHERE chat_jid = ?`, []any{pnJID, lidJID}},
 		{`UPDATE wa_chat_labels SET chat_jid = ? WHERE chat_jid = ? AND label_id NOT IN (SELECT label_id FROM wa_chat_labels WHERE chat_jid = ?)`,
 			[]any{pnJID, lidJID, pnJID}},
@@ -902,17 +943,23 @@ func migrateLIDChatsToPhoneJIDs(
 
 		var deleteChatQuery string
 
+		// The @lid chat goes only once it is empty: moveLIDChatRows leaves rows
+		// whose IDs another author used in the phone chat.
 		if isPostgresDB {
-			deleteChatQuery = `DELETE FROM chats WHERE jid = $1`
+			deleteChatQuery = `DELETE FROM chats WHERE jid = $1 AND NOT EXISTS (SELECT 1 FROM messages WHERE chat_jid = $1)`
 		} else {
-			deleteChatQuery = `DELETE FROM chats WHERE jid = ?`
+			deleteChatQuery = `DELETE FROM chats WHERE jid = ?1 AND NOT EXISTS (SELECT 1 FROM messages WHERE chat_jid = ?1)`
 		}
 
-		if _, err = tx.Exec(deleteChatQuery, c.JID); err != nil {
+		res, err := tx.Exec(deleteChatQuery, c.JID)
+		if err != nil {
 			logger.Warnf("LID migration: delete old chat failed %s: %v", c.JID, err)
 			_ = tx.Rollback()
 			skipped++
 			continue
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			logger.Warnf("LID migration: kept %s: it holds messages whose IDs another author used in %s", c.JID, pnStr)
 		}
 
 		if err = tx.Commit(); err != nil {
@@ -1221,30 +1268,21 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		return nil
 	}
 
-	if !isPostgres {
-		_, err := store.db.Exec(
-			`INSERT OR REPLACE INTO messages
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, quoted_message_id, quoted_sender, quoted_content, is_forwarded, direct_path)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, nullable(quotedID), nullable(quotedSender), nullable(quotedContent), isForwarded, nullable(directPath),
-		)
-		if err == nil && mediaType != "" {
-			store.recordPreScan(id, chatJID, fileSHA256, preScanFile(mediaType, filename, fileSHA256))
-		}
-		return err
-	}
-	// direct_path keeps the stored value on a re-store: it is either the same
-	// path from the same message, or a retry re-upload path that was verified
-	// to decrypt and is fresher than the message's original.
-	_, err := store.db.Exec(
+	// A re-store (history sync, a history replay, the echo of our own send) can
+	// carry an older snapshot of the message, so it never undoes a revoke or an
+	// edit already applied: deleted_at, edited_at and the receipts are left as
+	// they are, and an edited or revoked row keeps its text. direct_path keeps
+	// the stored value: it is either the same path from the same message, or a
+	// retry re-upload path that was verified to decrypt and is fresher than the
+	// message's original.
+	_, err := store.db.Exec(pgPlaceholders(
 		`INSERT INTO messages
     (id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, quoted_message_id, quoted_sender, quoted_content, is_forwarded, direct_path)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id, chat_jid) DO UPDATE SET
     direct_path = COALESCE(messages.direct_path, EXCLUDED.direct_path),
-    chat_jid = EXCLUDED.chat_jid,
     sender = EXCLUDED.sender,
-    content = EXCLUDED.content,
+    content = CASE WHEN messages.edited_at IS NOT NULL OR messages.deleted_at IS NOT NULL THEN messages.content ELSE EXCLUDED.content END,
     timestamp = EXCLUDED.timestamp,
     is_from_me = EXCLUDED.is_from_me,
     media_type = EXCLUDED.media_type,
@@ -1260,14 +1298,95 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
     is_forwarded = messages.is_forwarded OR EXCLUDED.is_forwarded,
     scan_status = CASE WHEN messages.file_sha256 IS DISTINCT FROM EXCLUDED.file_sha256 THEN NULL ELSE messages.scan_status END,
     scan_reason = CASE WHEN messages.file_sha256 IS DISTINCT FROM EXCLUDED.file_sha256 THEN NULL ELSE messages.scan_reason END,
-    scanned_at = CASE WHEN messages.file_sha256 IS DISTINCT FROM EXCLUDED.file_sha256 THEN NULL ELSE messages.scanned_at END`,
+    scanned_at = CASE WHEN messages.file_sha256 IS DISTINCT FROM EXCLUDED.file_sha256 THEN NULL ELSE messages.scanned_at END`),
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, nullable(quotedID), nullable(quotedSender), nullable(quotedContent), isForwarded, nullable(directPath),
 	)
-	if err == nil && mediaType != "" {
+	if err != nil {
+		return err
+	}
+	if mediaType != "" {
 		store.recordPreScan(id, chatJID, fileSHA256, preScanFile(mediaType, filename, fileSHA256))
 	}
+	store.applyPendingRevoke(id, chatJID, sender, isFromMe)
+	return nil
+}
 
-	return err
+// pgPlaceholders numbers a query's ? placeholders ($1, $2, ...) on Postgres.
+// The query must not contain a literal '?'.
+func pgPlaceholders(q string) string {
+	if !isPostgres {
+		return q
+	}
+	var b strings.Builder
+	n := 0
+	for _, r := range q {
+		if r == '?' {
+			n++
+			fmt.Fprintf(&b, "$%d", n)
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// savePendingRevoke keeps an author's revoke of a message not stored yet, so
+// storing it later (pairing history arriving after the revoke) still hides it.
+func (store *MessageStore) savePendingRevoke(chatJID, msgID string, fromMe bool, senders []string) {
+	// Each revoker gets its own row, so a revoke from someone else (a member, a
+	// forged one) cannot take the place of the author's.
+	q := `INSERT INTO pending_revokes (id, chat_jid, is_from_me, senders, revoked_at) VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT DO NOTHING`
+	if _, err := store.db.Exec(pgPlaceholders(q), msgID, chatJID, fromMe, strings.Join(senders, ","), time.Now()); err != nil {
+		slog.Warn("failed to keep a revoke for a message not stored yet", "id", msgID, "chat", chatJID, "error", err)
+	}
+	// Anyone can send revokes of made-up IDs; only the recent ones can still
+	// meet their message, so old rows are dropped, at most once a minute.
+	if now := time.Now(); now.Sub(time.Unix(pendingRevokePruned.Load(), 0)) > time.Minute {
+		pendingRevokePruned.Store(now.Unix())
+		_, _ = store.db.Exec(pgPlaceholders(`DELETE FROM pending_revokes WHERE revoked_at < ?`), now.Add(-pendingRevokeTTL))
+	}
+}
+
+const pendingRevokeTTL = 7 * 24 * time.Hour
+
+var pendingRevokePruned atomic.Int64
+
+// applyPendingRevoke tombstones a just-stored message when its author revoked
+// it before it arrived. Once the message is stored, live revokes find it, so
+// every pending row for it is dropped.
+func (store *MessageStore) applyPendingRevoke(id, chatJID, sender string, fromMe bool) {
+	q := `SELECT is_from_me, senders, revoked_at FROM pending_revokes WHERE id = ? AND chat_jid = ?`
+	rows, err := store.db.Query(pgPlaceholders(q), id, chatJID)
+	if err != nil {
+		return
+	}
+	var at time.Time
+	found, byAuthor := false, false
+	for rows.Next() {
+		var pendingFromMe bool
+		var senders string
+		var t time.Time
+		if rows.Scan(&pendingFromMe, &senders, &t) != nil {
+			continue
+		}
+		found = true
+		if pendingFromMe == fromMe && (fromMe || slices.Contains(strings.Split(senders, ","), senderUser(sender))) {
+			byAuthor, at = true, t
+		}
+	}
+	rows.Close()
+	if !found {
+		return
+	}
+	if byAuthor {
+		u := `UPDATE messages SET deleted_at = ? WHERE id = ? AND chat_jid = ? AND deleted_at IS NULL`
+		if _, err := store.db.Exec(pgPlaceholders(u), at, id, chatJID); err != nil {
+			slog.Warn("failed to apply an earlier revoke", "id", id, "chat", chatJID, "error", err)
+			return
+		}
+	}
+	_, _ = store.db.Exec(pgPlaceholders(`DELETE FROM pending_revokes WHERE id = ? AND chat_jid = ?`), id, chatJID)
 }
 
 // messageAuthor returns the stored sender and direction of a message, if any.
@@ -1300,17 +1419,17 @@ func sameAuthor(prevSender string, prevFromMe bool, sender string, fromMe bool) 
 // whose bytes were already checked (same file_sha256, e.g. a forwarded zip)
 // takes that verdict outright; otherwise the name/hash verdict is kept. It
 // never overwrites a verdict from the downloaded bytes (scanned_at set).
+// A verdict also covers the file's name and media type (a script named
+// invoice.pdf.js), so it is only taken from a copy with the same name and type.
 func (store *MessageStore) recordPreScan(id, chatJID string, fileSHA256 []byte, s FileScan) {
 	if len(fileSHA256) > 0 {
-		q := `SELECT scan_status, scan_reason, scanned_at FROM messages
-			WHERE file_sha256 = ? AND scanned_at IS NOT NULL AND NOT (id = ? AND chat_jid = ?) LIMIT 1`
-		if isPostgres {
-			q = `SELECT scan_status, scan_reason, scanned_at FROM messages
-			WHERE file_sha256 = $1 AND scanned_at IS NOT NULL AND NOT (id = $2 AND chat_jid = $3) LIMIT 1`
-		}
+		q := pgPlaceholders(`SELECT p.scan_status, p.scan_reason, p.scanned_at FROM messages p, messages m
+			WHERE m.id = ? AND m.chat_jid = ? AND p.file_sha256 = ? AND p.scanned_at IS NOT NULL
+			AND p.filename IS NOT DISTINCT FROM m.filename AND p.media_type IS NOT DISTINCT FROM m.media_type
+			AND NOT (p.id = m.id AND p.chat_jid = m.chat_jid) LIMIT 1`)
 		var status, reason sql.NullString
 		var at time.Time
-		if store.db.QueryRow(q, fileSHA256, id, chatJID).Scan(&status, &reason, &at) == nil {
+		if store.db.QueryRow(q, id, chatJID, fileSHA256).Scan(&status, &reason, &at) == nil {
 			u := `UPDATE messages SET scan_status = ?, scan_reason = ?, scanned_at = ? WHERE id = ? AND chat_jid = ? AND scanned_at IS NULL`
 			if isPostgres {
 				u = `UPDATE messages SET scan_status = $1, scan_reason = $2, scanned_at = $3 WHERE id = $4 AND chat_jid = $5 AND scanned_at IS NULL`
@@ -1334,8 +1453,9 @@ func (store *MessageStore) recordPreScan(id, chatJID string, fileSHA256 []byte, 
 }
 
 // SaveFileScan stores the verdict from a downloaded file's bytes, and gives
-// it to every other copy of the same file (same file_sha256) not yet checked,
-// so a zip forwarded into five chats is flagged in all five.
+// it to every other copy of the same file (same file_sha256, name and media
+// type) not yet checked, so a zip forwarded into five chats is flagged in all
+// five, while a copy under another name keeps its own name warnings.
 func (store *MessageStore) SaveFileScan(id, chatJID string, s FileScan) error {
 	now := time.Now()
 	q := `UPDATE messages SET scan_status = ?, scan_reason = ?, scanned_at = ? WHERE id = ? AND chat_jid = ?`
@@ -1349,11 +1469,11 @@ func (store *MessageStore) SaveFileScan(id, chatJID string, s FileScan) error {
 	if err != nil || len(sha) == 0 {
 		return nil
 	}
-	q = `UPDATE messages SET scan_status = ?, scan_reason = ?, scanned_at = ? WHERE file_sha256 = ? AND scanned_at IS NULL`
-	if isPostgres {
-		q = `UPDATE messages SET scan_status = $1, scan_reason = $2, scanned_at = $3 WHERE file_sha256 = $4 AND scanned_at IS NULL`
-	}
-	if _, err := store.db.Exec(q, s.Status, nullable(s.Reason), now, sha); err != nil {
+	q = pgPlaceholders(`UPDATE messages SET scan_status = ?, scan_reason = ?, scanned_at = ?
+		WHERE file_sha256 = ? AND scanned_at IS NULL
+		AND filename IS NOT DISTINCT FROM (SELECT filename FROM messages WHERE id = ? AND chat_jid = ?)
+		AND media_type IS NOT DISTINCT FROM (SELECT media_type FROM messages WHERE id = ? AND chat_jid = ?)`)
+	if _, err := store.db.Exec(q, s.Status, nullable(s.Reason), now, sha, id, chatJID, id, chatJID); err != nil {
 		slog.Warn("failed to share file verdict with copies", "message_id", id, "error", err)
 	}
 	return nil
@@ -2559,13 +2679,62 @@ func handleGroupInfoEvent(client *whatsmeow.Client, evt *events.GroupInfo, logge
 			log.Println("Group webhook marshal error:", err)
 			return
 		}
-		resp, err := http.Post(cfg.WebhookUrl, "application/json", bytes.NewBuffer(jsonData))
-		if err != nil {
-			log.Println("Group webhook POST error:", err)
-			return
+		if err := postWebhook(cfg.WebhookUrl, jsonData); err != nil {
+			slog.Warn("group webhook delivery failed after retries", "group", evt.JID.String(), "error", err)
 		}
-		defer resp.Body.Close()
 	}()
+}
+
+// Webhook deliveries are started by whoever messages the number, so each one
+// is time-bounded and only webhookSlots run at once: a receiver that accepts
+// connections but never answers cannot make the bridge pile up goroutines,
+// sockets and payloads until it runs out of memory.
+var (
+	webhookClient = &http.Client{Timeout: 30 * time.Second}
+	webhookSlots  = make(chan struct{}, 256)
+)
+
+const webhookQueueWait = 2 * time.Minute
+
+// webhookBackoff is the wait before each retry of a failed delivery, so a
+// receiver that is briefly down or slow still gets the message.
+var webhookBackoff = []time.Duration{5 * time.Second, 30 * time.Second, 2 * time.Minute}
+
+// postWebhook POSTs a JSON payload to the webhook receiver, retrying a failed
+// or 5xx delivery after each webhookBackoff wait. The error is the last
+// attempt's; the caller logs the message it carried.
+func postWebhook(url string, body []byte) error {
+	err := postWebhookOnce(url, body)
+	for _, wait := range webhookBackoff {
+		if err == nil {
+			return nil
+		}
+		time.Sleep(wait)
+		err = postWebhookOnce(url, body)
+	}
+	return err
+}
+
+// postWebhookOnce makes one delivery. It gives up when no slot frees within
+// webhookQueueWait.
+func postWebhookOnce(url string, body []byte) error {
+	select {
+	case webhookSlots <- struct{}{}:
+		defer func() { <-webhookSlots }()
+	case <-time.After(webhookQueueWait):
+		return fmt.Errorf("webhook receiver is backed up (%d deliveries in flight)", cap(webhookSlots))
+	}
+	resp, err := webhookClient.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	// Draining lets the connection be reused for the next delivery.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	resp.Body.Close()
+	if resp.StatusCode >= 500 {
+		return fmt.Errorf("webhook receiver answered %s", resp.Status)
+	}
+	return nil
 }
 
 // isGroupAdmin reports whether user is an admin of group, asking the server.
@@ -2687,6 +2856,8 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 				}
 				if err != nil {
 					logger.Warnf("Failed to delete revoked message: %v", err)
+				} else if !changed && !exists {
+					messageStore.savePendingRevoke(chatJID, target, msg.Info.IsFromMe, senders)
 				} else if !changed {
 					logger.Infof("Ignored revoke of %s in %s from %s: not the author or a group admin", target, chatJID, msg.Info.Sender)
 				}
@@ -2821,17 +2992,11 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			return
 		}
 
-		resp, err := http.Post(
-			cfg.WebhookUrl,
-			"application/json",
-			bytes.NewBuffer(jsonData),
-		)
-
-		if err != nil {
-			log.Println("Webhook POST error:", err)
+		if err := postWebhook(cfg.WebhookUrl, jsonData); err != nil {
+			slog.Warn("webhook delivery failed after retries; the receiver did not get this message",
+				"message_id", msg.Info.ID, "chat_jid", chatJID, "error", err)
 			return
 		}
-		defer resp.Body.Close()
 
 		slog.Info("Webhook sent",
 			"message_id", msg.Info.ID,
@@ -2888,13 +3053,13 @@ func (store *MessageStore) GetMediaInfo(id, chatJID string) (string, string, str
 	if isPostgres {
 		err = store.db.QueryRow(
 			`SELECT media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length 
-					 FROM messages 
-					 WHERE id = $1 AND chat_jid = $2`,
+					 FROM messages
+					 WHERE id = $1 AND chat_jid = $2 AND deleted_at IS NULL`,
 			id, chatJID,
 		).Scan(&mediaType, &filename, &url, &mediaKey, &fileSHA256, &fileEncSHA256, &fileLength)
 	} else {
 		err = store.db.QueryRow(
-			"SELECT media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length FROM messages WHERE id = ? AND chat_jid = ?",
+			"SELECT media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length FROM messages WHERE id = ? AND chat_jid = ? AND deleted_at IS NULL",
 			id, chatJID,
 		).Scan(&mediaType, &filename, &url, &mediaKey, &fileSHA256, &fileEncSHA256, &fileLength)
 	}
@@ -3033,11 +3198,12 @@ func storableChatJID(jid types.JID) bool {
 }
 
 // fileMatchesSHA256 reports whether data is the file a message's
-// WhatsApp-verified hash names. Rows from before hashes were stored have none;
-// their files are taken as they are, as before.
+// WhatsApp-verified hash names. The hash comes from the sender's message, so a
+// missing or malformed one names no file: the store has kept file_sha256 since
+// its first schema, and a valid download always has a 32-byte hash.
 func fileMatchesSHA256(data, want []byte) bool {
 	if len(want) != sha256.Size {
-		return true
+		return false
 	}
 	sum := sha256.Sum256(data)
 	return bytes.Equal(sum[:], want)
@@ -3053,7 +3219,7 @@ func fileAtPathMatchesSHA256(path string, want []byte) (bool, error) {
 	}
 	defer f.Close()
 	if len(want) != sha256.Size {
-		return true, nil
+		return false, nil
 	}
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
@@ -3077,20 +3243,18 @@ func fetchMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID,
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, err = messageStore.GetMediaInfo(messageID, chatJID)
 
 	if err != nil {
-		if isPostgres {
-			err = messageStore.db.QueryRow(
-				`SELECT media_type, filename FROM messages WHERE id = $1 AND chat_jid = $2`,
-				messageID, chatJID,
-			).Scan(&mediaType, &filename)
-		} else {
-			err = messageStore.db.QueryRow(
-				"SELECT media_type, filename FROM messages WHERE id = ? AND chat_jid = ?",
-				messageID, chatJID,
-			).Scan(&mediaType, &filename)
-		}
-
+		// GetMediaInfo skips revoked rows: once the sender deleted a message
+		// for everyone, its media is no longer served.
+		var deleted bool
+		err = messageStore.db.QueryRow(
+			pgPlaceholders("SELECT media_type, filename, deleted_at IS NOT NULL FROM messages WHERE id = ? AND chat_jid = ?"),
+			messageID, chatJID,
+		).Scan(&mediaType, &filename, &deleted)
 		if err != nil {
 			return false, "", "", "", nil, fmt.Errorf("failed to find message: %v", err)
+		}
+		if deleted {
+			return false, "", "", "", nil, fmt.Errorf("message deleted")
 		}
 	}
 
@@ -5979,7 +6143,7 @@ func (store *MessageStore) ListMessages(s ListMessagesParams) (string, error) {
         SELECT 
             m.timestamp, m.sender, c.name, CASE WHEN m.deleted_at IS NOT NULL THEN '[message deleted]' ELSE m.content END AS content, m.is_from_me, 
             c.jid, m.id, m.media_type,
-            m.quoted_message_id, m.quoted_sender, m.quoted_content, m.scan_status, m.scan_reason
+            m.quoted_message_id, m.quoted_sender, CASE WHEN EXISTS (SELECT 1 FROM messages qm WHERE qm.id = m.quoted_message_id AND qm.chat_jid = m.chat_jid AND qm.deleted_at IS NOT NULL) THEN '[message deleted]' ELSE m.quoted_content END, m.scan_status, m.scan_reason
         FROM messages m
         JOIN chats c ON m.chat_jid = c.jid
     `
@@ -6132,7 +6296,9 @@ type quoteSource struct {
 // GetQuoteSource loads a stored message by ID so a reply can be built from the
 // ID alone. An empty chatJID matches the newest message with that ID.
 func (store *MessageStore) GetQuoteSource(messageID, chatJID string) (quoteSource, error) {
-	q := "SELECT chat_jid, sender, content, media_type, is_from_me FROM messages WHERE id = ?"
+	// A message its sender deleted for everyone can no longer be quoted: its
+	// text must not reach a new reply.
+	q := "SELECT chat_jid, sender, content, media_type, is_from_me FROM messages WHERE id = ? AND deleted_at IS NULL"
 	args := []any{messageID}
 	if chatJID != "" {
 		q += " AND chat_jid = ?"
@@ -6219,7 +6385,7 @@ func (store *MessageStore) GetMessageContext(messageID string, before, after int
 	q := `
         SELECT m.timestamp, m.sender, c.name, CASE WHEN m.deleted_at IS NOT NULL THEN '[message deleted]' ELSE m.content END AS content, m.is_from_me,
                c.jid, m.id, m.media_type, m.chat_jid,
-               m.quoted_message_id, m.quoted_sender, m.quoted_content, m.scan_status, m.scan_reason
+               m.quoted_message_id, m.quoted_sender, CASE WHEN EXISTS (SELECT 1 FROM messages qm WHERE qm.id = m.quoted_message_id AND qm.chat_jid = m.chat_jid AND qm.deleted_at IS NOT NULL) THEN '[message deleted]' ELSE m.quoted_content END, m.scan_status, m.scan_reason
         FROM messages m
         JOIN chats c ON m.chat_jid = c.jid
         WHERE m.id = ` + placeholder(1)
@@ -6266,7 +6432,7 @@ func (store *MessageStore) GetMessageContext(messageID string, before, after int
 	qBefore := `
         SELECT m.timestamp, m.sender, c.name, CASE WHEN m.deleted_at IS NOT NULL THEN '[message deleted]' ELSE m.content END AS content, m.is_from_me,
                c.jid, m.id, m.media_type,
-               m.quoted_message_id, m.quoted_sender, m.quoted_content, m.scan_status, m.scan_reason
+               m.quoted_message_id, m.quoted_sender, CASE WHEN EXISTS (SELECT 1 FROM messages qm WHERE qm.id = m.quoted_message_id AND qm.chat_jid = m.chat_jid AND qm.deleted_at IS NOT NULL) THEN '[message deleted]' ELSE m.quoted_content END, m.scan_status, m.scan_reason
         FROM messages m
         JOIN chats c ON m.chat_jid = c.jid
         WHERE m.chat_jid = ` + placeholder(1) + `
@@ -6321,7 +6487,7 @@ func (store *MessageStore) GetMessageContext(messageID string, before, after int
 	qAfter := `
         SELECT m.timestamp, m.sender, c.name, CASE WHEN m.deleted_at IS NOT NULL THEN '[message deleted]' ELSE m.content END AS content, m.is_from_me,
                c.jid, m.id, m.media_type,
-               m.quoted_message_id, m.quoted_sender, m.quoted_content, m.scan_status, m.scan_reason
+               m.quoted_message_id, m.quoted_sender, CASE WHEN EXISTS (SELECT 1 FROM messages qm WHERE qm.id = m.quoted_message_id AND qm.chat_jid = m.chat_jid AND qm.deleted_at IS NOT NULL) THEN '[message deleted]' ELSE m.quoted_content END, m.scan_status, m.scan_reason
         FROM messages m
         JOIN chats c ON m.chat_jid = c.jid
         WHERE m.chat_jid = ` + placeholder(1) + `
@@ -6680,7 +6846,7 @@ func (store *MessageStore) GetLastInteraction(jid string) (string, error) {
         SELECT 
             m.timestamp, m.sender, c.name, CASE WHEN m.deleted_at IS NOT NULL THEN '[message deleted]' ELSE m.content END AS content, m.is_from_me,
             c.jid, m.id, m.media_type,
-            m.quoted_message_id, m.quoted_sender, m.quoted_content, m.scan_status, m.scan_reason
+            m.quoted_message_id, m.quoted_sender, CASE WHEN EXISTS (SELECT 1 FROM messages qm WHERE qm.id = m.quoted_message_id AND qm.chat_jid = m.chat_jid AND qm.deleted_at IS NOT NULL) THEN '[message deleted]' ELSE m.quoted_content END, m.scan_status, m.scan_reason
         FROM messages m
         JOIN chats c ON m.chat_jid = c.jid
         WHERE m.sender = ` + placeholder(1) + `
@@ -6912,7 +7078,7 @@ func main() {
 	}
 
 	dialect := "sqlite3"
-	connStr := "file:store/whatsapp.db?_foreign_keys=on&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	connStr := "file:store/whatsapp.db?_foreign_keys=on&_busy_timeout=5000&_journal_mode=WAL"
 
 	if cfg.DB.IsPostgres {
 		dialect = "postgres"

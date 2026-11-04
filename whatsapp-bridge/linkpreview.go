@@ -126,6 +126,20 @@ var (
 		netip.MustParsePrefix("::/96"),
 	}
 	thisNetwork = netip.MustParsePrefix("0.0.0.0/8")
+	// Special-purpose ranges IsGlobalUnicast lets through: IETF protocol
+	// assignments (incl. a cloud metadata address), benchmarking (fake-IP TUN
+	// proxies), documentation, reserved, deprecated site-local and discard.
+	nonPublicRanges = []netip.Prefix{
+		netip.MustParsePrefix("192.0.0.0/24"),
+		netip.MustParsePrefix("192.0.2.0/24"),
+		netip.MustParsePrefix("198.18.0.0/15"),
+		netip.MustParsePrefix("198.51.100.0/24"),
+		netip.MustParsePrefix("203.0.113.0/24"),
+		netip.MustParsePrefix("240.0.0.0/4"),
+		netip.MustParsePrefix("fec0::/10"),
+		netip.MustParsePrefix("100::/64"),
+		netip.MustParsePrefix("2001:db8::/32"),
+	}
 )
 
 func isPublicIP(raw net.IP) bool {
@@ -138,9 +152,11 @@ func isPublicIP(raw net.IP) bool {
 		b := ip.As16()
 		return isPublicIP(net.IP(b[12:]))
 	}
-	for _, p := range wrappedV4Ranges {
-		if p.Contains(ip) {
-			return false
+	for _, ranges := range [][]netip.Prefix{wrappedV4Ranges, nonPublicRanges} {
+		for _, p := range ranges {
+			if p.Contains(ip) {
+				return false
+			}
 		}
 	}
 	std := net.IP(ip.AsSlice())

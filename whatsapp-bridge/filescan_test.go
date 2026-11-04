@@ -154,6 +154,7 @@ func TestScanVerdictInListMessages(t *testing.T) {
 			t.Fatalf("%s: %v", q, err)
 		}
 	}
+	addLifecycleColumns(t, db)
 	s := &MessageStore{db: db}
 	sha, _ := hex.DecodeString("6c896d12eb9c90d96cdb6d0b81b87da3ea4b6ddde0dc0ae53aadb5875ad68649")
 	at := time.Date(2026, 10, 20, 9, 0, 0, 0, time.UTC)
@@ -210,6 +211,7 @@ func TestFileVerdictSharedByCopies(t *testing.T) {
 		PRIMARY KEY (id, chat_jid))`); err != nil {
 		t.Fatal(err)
 	}
+	addLifecycleColumns(t, db)
 	s := &MessageStore{db: db}
 	zip := []byte{0xd0, 0x7b, 0xc1}
 	at := time.Date(2026, 11, 3, 8, 0, 0, 0, time.UTC)

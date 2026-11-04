@@ -34,7 +34,10 @@ func TestStoreMessagePostgresUpsert(t *testing.T) {
 			is_from_me BOOLEAN, media_type TEXT, filename TEXT, url TEXT, media_key BYTEA, file_sha256 BYTEA,
 			file_enc_sha256 BYTEA, file_length BIGINT, quoted_message_id TEXT, quoted_sender TEXT, quoted_content TEXT,
 			is_forwarded BOOLEAN, direct_path TEXT, scan_status TEXT, scan_reason TEXT, scanned_at TIMESTAMP,
-			PRIMARY KEY (id, chat_jid))`,
+			deleted_at TIMESTAMP, edited_at TIMESTAMP, PRIMARY KEY (id, chat_jid))`,
+		`DROP TABLE IF EXISTS pending_revokes`,
+		`CREATE TABLE pending_revokes (id TEXT, chat_jid TEXT, is_from_me BOOLEAN NOT NULL, senders TEXT NOT NULL,
+			revoked_at TIMESTAMP NOT NULL, PRIMARY KEY (id, chat_jid))`,
 	} {
 		if _, err := db.Exec(q); err != nil {
 			t.Fatal(err)

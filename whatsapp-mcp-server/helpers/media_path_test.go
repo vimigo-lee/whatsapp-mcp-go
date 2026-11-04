@@ -39,6 +39,22 @@ func TestSendableMediaPath(t *testing.T) {
 		"whatsapp-bridge/store/messages.db":      false,
 		".config/gh/hosts.yml":                   false,
 		"vault.kdbx":                             false,
+		// macOS app data, the counterpart of AppData.
+		"Library/Application Support/Google/Chrome/Default/Cookies.txt": false,
+		"Library/Application Support/Signal/config.json":                false,
+		"Library/Containers/com.apple.mail/Data/msg.eml":                false,
+		"Library/Group Containers/group.net.whatsapp/ChatStorage.txt":   false,
+		"Library/Mobile Documents/report.pdf":                           true,
+		"Documents/Library/notes.pdf":                                   true,
+		// Linux per-user app config, covered as a hidden folder.
+		".config/google-chrome/Default/Preferences": false,
+		// SQLite sidecars hold the same rows as the database.
+		"whatsapp-bridge/store/messages.db-journal": false,
+		"whatsapp-bridge/store/messages.db-wal":     false,
+		"whatsapp-bridge/store/messages.db-shm":     false,
+		"profile/places.sqlite-wal":                 false,
+		"profile/places.sqlite-shm":                 false,
+		"profile/places.sqlite-journal":             false,
 	} {
 		_, err := sendableMediaPath(write(rel))
 		if (err == nil) != ok {

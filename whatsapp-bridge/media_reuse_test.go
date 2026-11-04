@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -24,6 +25,7 @@ func mediaReuseStore(t *testing.T) *MessageStore {
 		PRIMARY KEY (id, chat_jid))`); err != nil {
 		t.Fatal(err)
 	}
+	addLifecycleColumns(t, db)
 	return &MessageStore{db: db}
 }
 
@@ -89,22 +91,28 @@ func TestDownloadMediaNeverServesAnotherMessagesFile(t *testing.T) {
 	}
 }
 
-// Rows stored before hashes were recorded have none; their files are reused as
-// before rather than re-downloaded.
-func TestDownloadMediaReusesFilesOfRowsWithoutAHash(t *testing.T) {
+// A row without a 32-byte WhatsApp hash names no file: the hash comes from
+// the sender's message, so a missing, truncated or padded one must not let the
+// message claim another message's file that is on disk under the name it chose.
+func TestDownloadMediaNeverReusesAFileWithoutAValidHash(t *testing.T) {
 	prevPG := isPostgres
 	isPostgres = false
 	defer func() { isPostgres = prevPG }()
 	t.Chdir(t.TempDir())
 	s := mediaReuseStore(t)
 	group := "120363000000000004@g.us"
-	if err := s.StoreMessage("OLD", group, "x", "", time.Now(), false, "document", "old.pdf", "", "", nil, nil, nil, 0, "", "", "", false); err != nil {
-		t.Fatal(err)
-	}
+	victim := []byte("%PDF-1.4\nVICTIM\n%%EOF\n")
+	sum := sha256.Sum256(victim)
 	dir := filepath.Join("store", group)
 	os.MkdirAll(dir, 0o755)
-	os.WriteFile(filepath.Join(dir, "old.pdf"), []byte("%PDF-1.4\n%%EOF\n"), 0o644)
-	if ok, _, name, _, _, err := downloadMedia(nil, s, "OLD", group); !ok || err != nil || name != "old.pdf" {
-		t.Errorf("old row: ok=%v name=%q err=%v", ok, name, err)
+	os.WriteFile(filepath.Join(dir, "contract.pdf"), victim, 0o644)
+	for i, hash := range [][]byte{nil, sum[:16], append(sum[:], 0)} {
+		id := fmt.Sprintf("ATK%d", i)
+		if err := s.StoreMessage(id, group, "60100000002", "", time.Now(), false, "document", "contract.pdf", "", "", nil, hash, nil, 0, "", "", "", false); err != nil {
+			t.Fatal(err)
+		}
+		if ok, _, _, _, _, err := downloadMedia(nil, s, id, group); ok || err == nil {
+			t.Errorf("%s (hash of %d bytes): served another message's file", id, len(hash))
+		}
 	}
 }

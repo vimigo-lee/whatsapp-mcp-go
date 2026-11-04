@@ -54,7 +54,7 @@ func checkLIDMerge(t *testing.T, driver, dsn string, pg bool) {
 	}
 	for _, q := range []string{
 		`DROP TABLE IF EXISTS messages`, `DROP TABLE IF EXISTS reactions`, `DROP TABLE IF EXISTS wa_chat_labels`,
-		`CREATE TABLE messages (id TEXT, chat_jid TEXT, sender TEXT, content TEXT, timestamp TIMESTAMP,
+		`CREATE TABLE messages (id TEXT, chat_jid TEXT, sender TEXT, content TEXT, timestamp TIMESTAMP, is_from_me BOOLEAN NOT NULL DEFAULT FALSE,
 			deleted_at TIMESTAMP, edited_at TIMESTAMP, PRIMARY KEY (id, chat_jid))`,
 		`CREATE TABLE reactions (msg_id TEXT, sender TEXT, chat_jid TEXT, emoji TEXT, PRIMARY KEY (msg_id, sender))`,
 		`CREATE TABLE wa_chat_labels (chat_jid TEXT NOT NULL, label_id TEXT NOT NULL, PRIMARY KEY (chat_jid, label_id))`,

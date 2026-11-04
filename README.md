@@ -118,8 +118,7 @@ fits a long-running container — see "MCP server: stdio vs HTTP" below
 for when to use each.
 
 ```bash
-# 1. Set the four required vars, plus the recommended MCP_HTTP_TOKEN
-#    (in .env at repo root, or in your shell)
+# 1. Set the five required vars (in .env at repo root, or in your shell)
 cat > .env <<EOF
 WHATSAPP_API_KEY=$(openssl rand -base64 48)
 WHATSAPP_JWT_SECRET=$(openssl rand -base64 48)
@@ -134,7 +133,7 @@ docker compose up
 
 Once running:
 - Bridge REST API: `http://localhost:8080/api/...` (after `/auth/login`)
-- MCP HTTP endpoint: `http://localhost:5777` (send `Authorization: Bearer <MCP_HTTP_TOKEN>` if you set one)
+- MCP HTTP endpoint: `http://localhost:5777` (send `Authorization: Bearer <MCP_HTTP_TOKEN>`)
 
 ### MCP server: stdio vs HTTP
 
@@ -146,12 +145,15 @@ The MCP server has two run modes selected by `IS_HTTP`:
 | **HTTP** (`IS_HTTP=true`) | n8n, web automation, or any client connecting over the network | `docker compose up` — the `wa-mcp` service runs in HTTP mode by default, listening on `:5777` |
 
 The server holds your bridge credential, so anyone who reaches the HTTP port
-can read and send as your WhatsApp. Set `MCP_HTTP_TOKEN` (at least 32
-characters) and every request must then carry `Authorization: Bearer
-<MCP_HTTP_TOKEN>`. Without it, the server only accepts clients on loopback or
-a private network (Docker networks, your LAN, a tailnet) and refuses public
-addresses. That does not protect you if you put a reverse proxy in front of
-the port, so set the token before exposing it.
+can read and send as your WhatsApp. Any client on another machine, or in
+another container, needs `MCP_HTTP_TOKEN` (at least 32 characters) set on
+the server, and every request must then carry `Authorization: Bearer
+<MCP_HTTP_TOKEN>`. Without a token the server answers only loopback clients
+(127.0.0.1, ::1) on the same host and refuses everything else, private
+addresses included: Docker port forwarding and reverse proxies make every
+client look like it comes from a private address, so that address proves
+nothing. The bundled `docker-compose.yaml` therefore refuses to start
+`wa-mcp` until `MCP_HTTP_TOKEN` is set.
 
 Stdio mode is **not** appropriate for the Docker image — Claude Desktop
 does not natively `docker run` to spawn an MCP child. Build a local
@@ -256,7 +258,7 @@ By default, just the metadata of the media is stored in the local database. The 
 - **WhatsApp Already Logged In**: If your session is already active, the Go bridge will automatically reconnect without showing a QR code.
 - **Device Limit Reached**: WhatsApp limits the number of linked devices. If you reach this limit, you'll need to remove an existing device from WhatsApp on your phone (Settings > Linked Devices).
 - **No Messages Loading**: After initial authentication, it can take several minutes for your message history to load, especially if you have many chats.
-- **WhatsApp Out of Sync**: If your WhatsApp messages get out of sync with the bridge, delete both database files (`whatsapp-bridge/store/messages.db` and `whatsapp-bridge/store/whatsapp.db`) and restart the bridge to re-authenticate.
+- **WhatsApp Out of Sync**: If your WhatsApp messages get out of sync with the bridge, stop the bridge, delete both databases together with their `-wal` and `-shm` files (`whatsapp-bridge/store/messages.db*` and `whatsapp-bridge/store/whatsapp.db*`), and restart the bridge to re-authenticate. A leftover `-wal` file next to a new database can bring old rows back or corrupt it.
 
 This fork takes the core idea and rebuilds it with a different philosophy:  
 **one language, one binary, clean architecture, and flexible deployment.**

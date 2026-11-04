@@ -48,18 +48,22 @@ func TestHTTPTransportRequiresBearerToken(t *testing.T) {
 	}
 }
 
-// Without a token, a peer on a public address must be refused while loopback,
-// private-network and tailnet peers (existing deployments) keep working.
-func TestPrivateNetworkOnlyWithoutToken(t *testing.T) {
-	handler := privateNetworkOnly(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+// Without a token only loopback peers are served. Private, tailnet and CGNAT
+// peers are refused as well: Docker port forwarding and reverse proxies make
+// any remote client arrive from such an address.
+func TestLoopbackOnlyWithoutToken(t *testing.T) {
+	handler := loopbackOnly(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	cases := map[string]int{
 		"127.0.0.1:5000":       http.StatusOK,
+		"127.8.9.10:5000":      http.StatusOK,
 		"[::1]:5000":           http.StatusOK,
-		"172.18.0.5:5000":      http.StatusOK,
-		"192.168.1.20:5000":    http.StatusOK,
-		"10.0.0.7:5000":        http.StatusOK,
-		"100.101.102.103:5000": http.StatusOK,
-		"[::ffff:10.0.0.7]:1":  http.StatusOK,
+		"[::ffff:127.0.0.1]:1": http.StatusOK,
+		"172.18.0.5:5000":      http.StatusForbidden, // Docker gateway / port forward
+		"192.168.1.20:5000":    http.StatusForbidden,
+		"10.0.0.7:5000":        http.StatusForbidden,
+		"100.101.102.103:5000": http.StatusForbidden,
+		"[fd00::1]:5000":       http.StatusForbidden,
+		"[::ffff:10.0.0.7]:1":  http.StatusForbidden,
 		"203.0.113.9:5000":     http.StatusForbidden,
 		"[2001:db8::1]:5000":   http.StatusForbidden,
 		"8.8.8.8:5000":         http.StatusForbidden,

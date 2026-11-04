@@ -20,17 +20,37 @@ func ConvertToOpusOggTemp(inputFile string) (string, error) {
 	return ConvertToOpusOggTempWithParams(inputFile, defaultBitrate, defaultSampleRate)
 }
 
+// ffmpegCommand builds the ffmpeg invocation; tests replace it to observe
+// what would run.
+var ffmpegCommand = func(args ...string) *exec.Cmd {
+	return exec.Command("ffmpeg", args...)
+}
+
 // ConvertToOpusOgg converts an audio file to Opus format in an Ogg container.
+//
+// ffmpeg's -i takes URLs as readily as files (http, ftp, concat, ...), so a
+// media_path that is really a URL would have it fetch from the server's own
+// network. Only an existing regular file is accepted, and ffmpeg is told to
+// read nothing but that file.
 func ConvertToOpusOgg(inputFile string, outputFile string, bitrate string, sampleRate int) (string, error) {
-	// Check if input file exists
-	if _, err := os.Stat(inputFile); os.IsNotExist(err) {
-		return "", fmt.Errorf("input file not found: %s", inputFile)
+	absInput, err := filepath.Abs(inputFile)
+	if err != nil {
+		return "", fmt.Errorf("invalid input path %s: %w", inputFile, err)
+	}
+	// Any Stat error is a refusal: a long URL fails with ENAMETOOLONG and a
+	// Windows "http://" with ERROR_INVALID_NAME, neither of which is NotExist.
+	info, err := os.Stat(absInput)
+	if err != nil {
+		return "", fmt.Errorf("input file not readable: %s", inputFile)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("input is not a regular file: %s", inputFile)
 	}
 
 	// If no output file is specified, replace extension with .ogg
 	if outputFile == "" {
-		ext := filepath.Ext(inputFile)
-		outputFile = strings.TrimSuffix(inputFile, ext) + ".ogg"
+		ext := filepath.Ext(absInput)
+		outputFile = strings.TrimSuffix(absInput, ext) + ".ogg"
 	}
 
 	// Ensure output directory exists
@@ -42,8 +62,10 @@ func ConvertToOpusOgg(inputFile string, outputFile string, bitrate string, sampl
 	}
 
 	// Build the ffmpeg command
-	cmd := exec.Command("ffmpeg",
-		"-i", inputFile,
+	cmd := ffmpegCommand(
+		"-nostdin",
+		"-protocol_whitelist", "file",
+		"-i", "file:"+absInput,
 		"-c:a", "libopus",
 		"-b:a", bitrate,
 		"-ar", fmt.Sprintf("%d", sampleRate),
@@ -80,11 +102,8 @@ func ConvertToOpusOggTempWithParams(inputFile string, bitrate string, sampleRate
 	// Convert the audio
 	result, err := ConvertToOpusOgg(inputFile, tempPath, bitrate, sampleRate)
 	if err != nil {
-		// Clean up on failure
-		err := os.Remove(tempPath)
-		if err != nil {
-			return "", err
-		}
+		// Clean up on failure; the conversion error is the one that matters.
+		_ = os.Remove(tempPath)
 		return "", err
 	}
 

@@ -17,6 +17,7 @@ func TestRevokedMessagesReadAsDeleted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { ms.Close() }) // before TempDir cleanup: Windows cannot remove an open WAL database
 	chat := "60100000001@s.whatsapp.net"
 	at := time.Date(2026, 11, 3, 8, 0, 0, 0, time.UTC)
 	if err := ms.StoreChat(chat, "Ali", at); err != nil {

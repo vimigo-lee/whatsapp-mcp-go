@@ -22,6 +22,7 @@ coverage.txt
 
 # Logs
 *.log
+*.err
 
 # Editors / IDEs
 .idea/

@@ -13,8 +13,8 @@ import (
 // Without a token, a request reaching the server through DNS rebinding
 // carries the attacker's domain as Host and is refused; local and Docker
 // clients keep working.
-func TestPrivateNetworkOnlyRefusesRebindingHosts(t *testing.T) {
-	handler := privateNetworkOnly(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+func TestLoopbackOnlyRefusesRebindingHosts(t *testing.T) {
+	handler := loopbackOnly(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	for host, want := range map[string]int{
 		"localhost:5777":        http.StatusOK,
 		"127.0.0.1:5777":        http.StatusOK,
@@ -29,7 +29,7 @@ func TestPrivateNetworkOnlyRefusesRebindingHosts(t *testing.T) {
 		"mypc.example.org":      http.StatusForbidden,
 	} {
 		req := httptest.NewRequest(http.MethodPost, "/", nil)
-		req.RemoteAddr = "172.17.0.1:40000"
+		req.RemoteAddr = "127.0.0.1:40000"
 		req.Host = host
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
@@ -39,7 +39,7 @@ func TestPrivateNetworkOnlyRefusesRebindingHosts(t *testing.T) {
 	}
 	t.Setenv("MCP_ALLOWED_HOSTS", "mypc.example.org, other.example")
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
-	req.RemoteAddr = "192.168.1.20:40000"
+	req.RemoteAddr = "[::1]:40000"
 	req.Host = "MyPC.Example.org"
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)

@@ -31,6 +31,7 @@ func quoteTestStore(t *testing.T) *MessageStore {
 			t.Fatalf("%s: %v", q, err)
 		}
 	}
+	addLifecycleColumns(t, db)
 	return &MessageStore{db: db}
 }
 

@@ -14,9 +14,10 @@ import (
 // other people wrote, so a message can try to talk it into sending a secret
 // from this machine to the sender. Ordinary documents and photos stay
 // sendable; files that only a program would ever need are refused: hidden
-// folders (.ssh, .aws, .config, .git, ...), Windows AppData (browser
-// profiles, saved logins), macOS keychains, the process and device trees on
-// Linux (/proc/self/environ holds this server's own bridge key), mounted
+// folders (.ssh, .aws, .config, .git, ...), Windows AppData and macOS
+// Library/Application Support (browser profiles, saved logins), keychains,
+// the process and device trees on Linux (/proc/self/environ holds this
+// server's own bridge key), mounted
 // container secrets, system configuration, and private key files whatever
 // their name. MEDIA_PATH_ROOTS, a list of folders separated by the OS
 // path-list separator, narrows sending to those folders.
@@ -27,6 +28,15 @@ import (
 var secretFileSuffixes = []string{
 	".pem", ".p12", ".pfx", ".ppk", ".kdbx", ".keystore", ".jks",
 	".ovpn", ".gpg", ".asc", ".db", ".sqlite", ".sqlite3", ".env", ".keychain", ".keychain-db",
+	// SQLite journals sit beside the database and hold the same rows.
+	".db-journal", ".db-wal", ".db-shm", ".sqlite-journal", ".sqlite-wal", ".sqlite-shm",
+	".sqlite3-journal", ".sqlite3-wal", ".sqlite3-shm",
+}
+
+// macOS keeps each app's own data (browser profiles, chat stores, tokens)
+// under ~/Library in these folders, the counterpart of Windows AppData.
+var macAppDataFolders = map[string]bool{
+	"application support": true, "containers": true, "group containers": true,
 }
 
 var secretFileNames = map[string]bool{
@@ -59,6 +69,10 @@ func sendableMediaPath(absPath string) (string, error) {
 	}
 	if info.IsDir() {
 		return "", fmt.Errorf("%s is a folder, not a file", absPath)
+	}
+	// A device, pipe or socket is not a document, and reading one can block.
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("%s is not a regular file", absPath)
 	}
 	// Judge the file by where it really lives. EvalSymlinks fails on paths
 	// through a Windows junction (a Documents folder moved to another drive);
@@ -118,6 +132,9 @@ func secretPathReason(p string) string {
 			// AppData\Local\Temp is where generated files (a report an
 			// assistant just wrote) usually sit before they are sent.
 			return "it is inside AppData, where programs keep their own data"
+		}
+		if lower == "library" && i+2 < len(clean) && macAppDataFolders[strings.ToLower(clean[i+1])] {
+			return "it is inside Library/" + clean[i+1] + ", where programs keep their own data"
 		}
 		if !last && lower == "keychains" {
 			return "it is a keychain"

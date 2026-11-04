@@ -35,6 +35,19 @@ func TestMediaURLClientRefusesNonPublicAddresses(t *testing.T) {
 		"fd00::1":         false,
 		"fe80::1":         false,
 		"::ffff:10.0.0.1": false,
+		"192.0.0.170":     false, // IETF protocol assignments (NAT64 discovery)
+		"192.0.2.1":       false, // TEST-NET-1
+		"198.18.0.1":      false, // benchmarking
+		"198.19.255.254":  false,
+		"198.51.100.7":    false, // TEST-NET-2
+		"203.0.113.9":     false, // TEST-NET-3
+		"240.0.0.1":       false, // reserved class E
+		"255.255.255.255": false,
+		"fec0::1":         false, // deprecated site-local
+		"100::1":          false, // discard-only
+		"2001:db8::1":     false, // documentation
+		"192.0.3.1":       true,
+		"198.20.0.1":      true,
 		"8.8.8.8":         true,
 		"31.97.70.27":     true, // the MinIO host media links point at
 		"2606:4700::1111": true,

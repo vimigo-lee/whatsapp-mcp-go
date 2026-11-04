@@ -47,6 +47,7 @@ func TestReceivedEditsAndRevokesOnlyTouchTheAuthorsRow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { ms.Close() }) // before TempDir cleanup: Windows cannot remove an open WAL database
 	client := &whatsmeow.Client{Store: &wastore.Device{}}
 	admin := types.NewJID("60144444444", types.DefaultUserServer)
 	prevAdmin := isGroupAdmin

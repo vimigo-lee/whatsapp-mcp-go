@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -167,13 +168,24 @@ func SendAudioVoiceMessage(recipient, mediaPath string) (bool, string) {
 	if mediaPath == "" {
 		return false, "Media path must be provided"
 	}
-	if _, err := os.Stat(mediaPath); os.IsNotExist(err) {
-		return false, "Media file not found: " + mediaPath
+	// The path reaches ffmpeg, which would just as happily fetch a URL, and
+	// it is chosen by a model that reads other people's messages. It gets
+	// the same checks as send_media's media_path.
+	if !callerFilesReadable() {
+		return false, "this server is remote and cannot read " + mediaPath + "; send the audio with send_media instead"
+	}
+	absPath, err := filepath.Abs(mediaPath)
+	if err != nil {
+		return false, "Invalid media path: " + err.Error()
+	}
+	absPath, err = sendableMediaPath(absPath)
+	if err != nil {
+		return false, err.Error()
 	}
 
-	finalPath := mediaPath
-	if !strings.HasSuffix(strings.ToLower(mediaPath), ".ogg") {
-		converted, err := ConvertToOpusOggTemp(mediaPath)
+	finalPath := absPath
+	if !strings.HasSuffix(strings.ToLower(absPath), ".ogg") {
+		converted, err := ConvertToOpusOggTemp(absPath)
 		if err != nil {
 			return false, "Audio conversion failed (ffmpeg required?): " + err.Error()
 		}

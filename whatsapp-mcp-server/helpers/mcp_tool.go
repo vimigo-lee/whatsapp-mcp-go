@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -125,7 +126,7 @@ func InitMcpTool() {
 
 	mcp.AddTool[sendAudioMessageInput, map[string]any](server, &mcp.Tool{
 		Name:        "send_audio_message",
-		Description: "Send audio/voice message (converted to Opus .ogg if needed).",
+		Description: sendAudioDescription(),
 	}, sendAudioMessageHandler)
 
 	mcp.AddTool[downloadMediaInput, map[string]any](server, &mcp.Tool{
@@ -218,10 +219,10 @@ func InitMcpTool() {
 		if token != "" {
 			handler = requireBearerToken(token, mcpHandler)
 		} else {
-			slog.Warn("MCP_HTTP_TOKEN is not set: only loopback and private-network clients are accepted, and any of them can use every tool as this WhatsApp account. Set MCP_HTTP_TOKEN (openssl rand -base64 48) and send it as 'Authorization: Bearer <token>'.")
-			handler = privateNetworkOnly(mcpHandler)
+			slog.Warn("MCP_HTTP_TOKEN is not set: only loopback clients are accepted, and any of them can use every tool as this WhatsApp account. Docker port forwarding and reverse proxies make remote clients look local, so they are refused. Set MCP_HTTP_TOKEN (openssl rand -base64 48) and send it as 'Authorization: Bearer <token>'.")
+			handler = loopbackOnly(mcpHandler)
 		}
-		if err := http.ListenAndServe(addr, handler); err != nil {
+		if err := newMCPHTTPServer(addr, handler).ListenAndServe(); err != nil {
 			log.Fatalf("Server failed: %v", err)
 		}
 	} else {
@@ -230,6 +231,33 @@ func InitMcpTool() {
 			log.Fatalf("stdio failed: %v", err)
 		}
 	}
+}
+
+// mcpReadHeaderTimeout bounds how long a client may take to send its request
+// headers; a variable so tests can shorten it.
+var mcpReadHeaderTimeout = 10 * time.Second
+
+// newMCPHTTPServer returns the HTTP server for the MCP endpoint. Without
+// timeouts a client that trickles its headers holds a connection forever.
+// WriteTimeout stays unset: streamable HTTP keeps SSE responses open.
+func newMCPHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: mcpReadHeaderTimeout,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    64 << 10,
+	}
+}
+
+// bridgePathSegment escapes a tool argument for use as one segment of a
+// bridge API path, so a value like "../auth/passkey-code" cannot climb out
+// of the route it was meant for.
+func bridgePathSegment(name, v string) (string, error) {
+	if v == "." || v == ".." {
+		return "", fmt.Errorf("%s is not valid", name)
+	}
+	return url.PathEscape(v), nil
 }
 
 type searchContactsInput struct {
@@ -628,8 +656,12 @@ func getMessageContextHandler(
 		return ErrResult("message_id is required"), nil, nil
 	}
 
+	id, err := bridgePathSegment("message_id", in.MessageID)
+	if err != nil {
+		return ErrResult(err.Error()), nil, nil
+	}
 	path := fmt.Sprintf("/messages/context/%s?before=%d&after=%d",
-		in.MessageID, in.Before, in.After)
+		id, in.Before, in.After)
 
 	data, err := callAPI(http.MethodGet, path, nil)
 	if err != nil {
@@ -653,8 +685,12 @@ func listChatsHandler(
 	if in.Query != nil && *in.Query != "" {
 		q += "&q=" + url.QueryEscape(*in.Query)
 	}
-	if in.SortBy != "" {
+	switch in.SortBy {
+	case "":
+	case "last_active", "name":
 		q += "&sort=" + in.SortBy
+	default:
+		return ErrResult("sort_by must be last_active or name"), nil, nil
 	}
 	if in.UnreadOnly {
 		q += "&unread_only=true"
@@ -683,7 +719,11 @@ func getChatHandler(
 		return ErrResult("chat_jid is required"), nil, nil
 	}
 
-	data, err := callAPI(http.MethodGet, "/chats/"+in.ChatJid, nil)
+	jid, err := bridgePathSegment("chat_jid", in.ChatJid)
+	if err != nil {
+		return ErrResult(err.Error()), nil, nil
+	}
+	data, err := callAPI(http.MethodGet, "/chats/"+jid, nil)
 	if err != nil {
 		return ErrResult(err.Error()), nil, nil
 	}
@@ -722,7 +762,11 @@ func getDirectChatByContactHandler(
 	}
 
 	// GET /api/direct-contacts/{phone}/chat
-	path := fmt.Sprintf("/direct-contacts/%s/chat", in.SenderPhoneNumber)
+	phone, err := bridgePathSegment("sender_phone_number", in.SenderPhoneNumber)
+	if err != nil {
+		return ErrResult(err.Error()), nil, nil
+	}
+	path := fmt.Sprintf("/direct-contacts/%s/chat", phone)
 
 	data, err := callAPI(http.MethodGet, path, nil)
 	if err != nil {
@@ -769,7 +813,11 @@ func getContactChatsHandler(
 	}
 
 	// GET /api/contacts/{jid}/chats?limit=...&page=...
-	path := fmt.Sprintf("/contacts/%s/chats?limit=%d&page=%d", in.Jid, limit, page)
+	jid, err := bridgePathSegment("jid", in.Jid)
+	if err != nil {
+		return ErrResult(err.Error()), nil, nil
+	}
+	path := fmt.Sprintf("/contacts/%s/chats?limit=%d&page=%d", jid, limit, page)
 
 	data, err := callAPI(http.MethodGet, path, nil)
 	if err != nil {
@@ -997,7 +1045,7 @@ const minHTTPTokenLen = 32
 // mcpHTTPToken returns the bearer token HTTP clients must present, or "" when
 // none is configured. Every tool runs with this server's bridge credential, so
 // a token that is set but weak is refused outright; an unset token keeps
-// existing deployments working behind privateNetworkOnly.
+// local-only deployments working behind loopbackOnly.
 func mcpHTTPToken() (string, error) {
 	token := ReadEnv("MCP_HTTP_TOKEN", "")
 	if token != "" && len(token) < minHTTPTokenLen {
@@ -1052,6 +1100,21 @@ var (
 		netip.MustParsePrefix("::/96"),
 	}
 	thisNetwork = netip.MustParsePrefix("0.0.0.0/8")
+	// Special-purpose ranges that net/netip counts as global unicast but that
+	// never belong to a public media host: IETF protocol assignments,
+	// benchmarking, reserved class E, deprecated site-local, discard-only,
+	// and the documentation ranges.
+	nonPublicRanges = []netip.Prefix{
+		netip.MustParsePrefix("192.0.0.0/24"),
+		netip.MustParsePrefix("192.0.2.0/24"),
+		netip.MustParsePrefix("198.18.0.0/15"),
+		netip.MustParsePrefix("198.51.100.0/24"),
+		netip.MustParsePrefix("203.0.113.0/24"),
+		netip.MustParsePrefix("240.0.0.0/4"),
+		netip.MustParsePrefix("fec0::/10"),
+		netip.MustParsePrefix("100::/64"),
+		netip.MustParsePrefix("2001:db8::/32"),
+	}
 )
 
 func isPublicAddr(ip netip.Addr) bool {
@@ -1060,19 +1123,23 @@ func isPublicAddr(ip netip.Addr) bool {
 		b := ip.As16()
 		return isPublicAddr(netip.AddrFrom4([4]byte(b[12:])))
 	}
-	for _, p := range wrappedV4Ranges {
-		if p.Contains(ip) {
-			return false
+	for _, ranges := range [][]netip.Prefix{wrappedV4Ranges, nonPublicRanges} {
+		for _, p := range ranges {
+			if p.Contains(ip) {
+				return false
+			}
 		}
 	}
 	return ip.IsGlobalUnicast() && !ip.IsPrivate() && !sharedAddressSpace.Contains(ip) && !thisNetwork.Contains(ip)
 }
 
-// privateNetworkOnly serves only peers on loopback or a private network
-// (Docker networks, the LAN, a tailnet) and refuses public addresses. It is the
-// fallback when no MCP_HTTP_TOKEN is set, so a port published to the internet
-// does not hand the owner's WhatsApp to strangers.
-func privateNetworkOnly(next http.Handler) http.Handler {
+// loopbackOnly serves only peers on this machine's loopback (127.0.0.0/8,
+// ::1). It is the fallback when no MCP_HTTP_TOKEN is set, so a reachable port
+// does not hand the owner's WhatsApp to strangers. A private peer address
+// proves nothing: Docker port forwarding presents every client as the network
+// gateway (172.x) and a reverse proxy presents them as itself, so those are
+// refused too.
+func loopbackOnly(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host, _, err := net.SplitHostPort(r.RemoteAddr)
 		ip, perr := netip.ParseAddr(host)
@@ -1081,8 +1148,8 @@ func privateNetworkOnly(next http.Handler) http.Handler {
 			return
 		}
 		ip = ip.Unmap()
-		if !ip.IsLoopback() && !ip.IsPrivate() && !sharedAddressSpace.Contains(ip) {
-			slog.Warn("refused MCP request from public address; set MCP_HTTP_TOKEN to allow authenticated remote clients", "remote", ip.String())
+		if !ip.IsLoopback() {
+			slog.Warn("refused MCP request from a non-loopback address: without MCP_HTTP_TOKEN only loopback clients are served, because Docker port forwarding and reverse proxies make remote clients look private. Set MCP_HTTP_TOKEN and send it as a bearer token", "remote", ip.String())
 			http.Error(w, "forbidden: set MCP_HTTP_TOKEN on the server and send it as a bearer token", http.StatusForbidden)
 			return
 		}
@@ -1160,6 +1227,15 @@ func requireBearerToken(token string, next http.Handler) http.Handler {
 // the bytes inline, so a bridge across the LAN is served just as well as one on
 // loopback. Testing the bridge host would deny the path route to a stdio install
 // pointed at a LAN bridge — which is the shipped default.
+// sendAudioDescription says where send_audio_message can read from: it converts
+// a file on this machine, so a remote (HTTP) server cannot take a caller path.
+func sendAudioDescription() string {
+	if callerFilesReadable() {
+		return "Send audio/voice message from a local file (converted to Opus .ogg if needed)."
+	}
+	return "Send audio/voice message. This server is remote and cannot read your files: upload an Opus .ogg with upload_media and send it with send_media instead."
+}
+
 func callerFilesReadable() bool {
 	return !servesRemoteClients()
 }
@@ -1521,7 +1597,11 @@ func uploadMediaHandler(
 	}
 	slotReq.Header.Set("Content-Type", "application/json")
 	slotReq.Header.Set("x-internal-secret", secret)
-	client := &http.Client{Timeout: apiTimeout}
+	// No redirects: following one to another host would carry
+	// x-internal-secret there.
+	client := &http.Client{Timeout: apiTimeout, CheckRedirect: func(req *http.Request, _ []*http.Request) error {
+		return fmt.Errorf("refusing to follow redirect to %s", req.URL.Redacted())
+	}}
 	slotResp, err := client.Do(slotReq)
 	if err != nil {
 		return &mcp.CallToolResult{IsError: true}, map[string]any{"success": false, "error": fmt.Sprintf("upload-url request failed: %v", err)}, nil
