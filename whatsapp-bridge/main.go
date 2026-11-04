@@ -5274,7 +5274,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 	// Without this, a chat first seen before its contact name was available stays
 	// stuck showing the number forever (e.g. it never picks up a later-saved contact).
 	if err == nil && existingName != "" && existingName != jid.User && existingName != sender {
-		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
+		logger.Infof("Using existing chat name for %s: %q", chatJID, existingName)
 		return existingName
 	}
 
@@ -5316,7 +5316,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 			}
 		}
 
-		logger.Infof("Using group name: %s", name)
+		logger.Infof("Using group name: %q", name)
 	} else {
 		logger.Infof("Getting name for contact: %s", chatJID)
 
@@ -5345,7 +5345,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 			}
 		}
 
-		logger.Infof("Using contact name: %s", name)
+		logger.Infof("Using contact name: %q", name)
 	}
 
 	return name
@@ -5438,7 +5438,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					content = contactCardContent(unwrapMessage(msg.Message.Message))
 				}
 
-				logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
+				logger.Infof("Message content: %q, Media Type: %q", content, mediaType)
 
 				if content == "" && mediaType == "" {
 					continue
@@ -5535,10 +5535,10 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 						oldestStored = timestamp
 					}
 					if mediaType != "" {
-						logger.Infof("Stored message: [%s] %s -> %s: [%s: %s] %s",
+						logger.Infof("Stored message: [%s] %q -> %q: [%q: %q] %q",
 							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, mediaType, filename, content)
 					} else {
-						logger.Infof("Stored message: [%s] %s -> %s: %s",
+						logger.Infof("Stored message: [%s] %q -> %q: %q",
 							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, content)
 					}
 				}
