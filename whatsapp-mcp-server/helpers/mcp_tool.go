@@ -347,6 +347,7 @@ type sendMediaInput struct {
 	MediaPath *string `json:"media_path,omitempty" jsonschema:"description:Absolute path to a file the server can read. On a local install this is the machine you are running on — use it for any local file instead of base64. On a remote install it cannot work; upload the file first. Provide exactly one of url/base64/media_path."`
 	Filename  *string `json:"filename,omitempty" jsonschema:"description:Filename with extension (e.g. photo.jpg); drives the media type. Optional when url already ends in a filename."`
 	Caption   *string `json:"caption,omitempty" jsonschema:"description:Optional text caption sent with the media"`
+	SendAs    *string `json:"send_as,omitempty" jsonschema:"description:Optional. 'gif' sends an MP4 as a looping muted WhatsApp GIF (WhatsApp GIFs are MP4s — convert .gif files to .mp4 first). 'sticker' sends a WebP (512x512, animated WebP for a moving sticker, max 500 KB, no caption) as a sticker. Omit or 'media' for a normal image/video/document."`
 }
 
 type sendAudioMessageInput struct {
@@ -878,6 +879,15 @@ func sendMediaHandler(
 	if in.Recipient == "" {
 		return &mcp.CallToolResult{IsError: true}, map[string]any{"success": false, "error": "recipient is required"}, nil
 	}
+	sendAs := ""
+	if in.SendAs != nil {
+		sendAs = strings.ToLower(strings.TrimSpace(*in.SendAs))
+	}
+	switch sendAs {
+	case "", "media", "gif", "sticker":
+	default:
+		return &mcp.CallToolResult{IsError: true}, map[string]any{"success": false, "error": "send_as must be one of: media, gif, sticker"}, nil
+	}
 	hasURL := in.URL != nil && strings.TrimSpace(*in.URL) != ""
 	hasB64 := in.Base64 != nil && strings.TrimSpace(*in.Base64) != ""
 	hasPath := in.MediaPath != nil && strings.TrimSpace(*in.MediaPath) != ""
@@ -931,6 +941,9 @@ func sendMediaHandler(
 		}
 		if in.Caption != nil && *in.Caption != "" {
 			payload["message"] = *in.Caption
+		}
+		if sendAs != "" && sendAs != "media" {
+			payload["send_as"] = sendAs
 		}
 		if _, err := callAPI(http.MethodPost, "/send", payload); err != nil {
 			return &mcp.CallToolResult{IsError: true}, map[string]any{"success": false, "error": err.Error()}, nil
@@ -1006,6 +1019,9 @@ func sendMediaHandler(
 	if in.Caption != nil && *in.Caption != "" {
 		payload["message"] = *in.Caption
 	}
+	if sendAs != "" && sendAs != "media" {
+		payload["send_as"] = sendAs
+	}
 
 	if _, err := callAPI(http.MethodPost, "/send", payload); err != nil {
 		return &mcp.CallToolResult{IsError: true}, map[string]any{"success": false, "error": err.Error()}, nil
@@ -1016,7 +1032,7 @@ func sendMediaHandler(
 // sendMediaDescription tailors send_media's guidance to the deployment: a local
 // install reads files off disk, a remote one cannot and needs an upload first.
 func sendMediaDescription() string {
-	const base = "Send an image, video or document (with an optional text caption) to a WhatsApp chat. Provide the media as EXACTLY ONE of: "
+	const base = "Send an image, video, document, looping GIF or sticker (see send_as) to a WhatsApp chat, with an optional text caption. Provide the media as EXACTLY ONE of: "
 	if callerFilesReadable() {
 		return base + "'media_path' (absolute path to a file on THIS machine — PREFERRED for local files such as spreadsheets, PDFs and photos; the server reads the bytes itself, so never base64 a local file into the tool call), 'url' (a public http(s) link the server downloads), or 'base64' (raw media bytes — last resort). Always pass a 'filename' with its real extension (e.g. report.xlsx) so the document arrives with the right type; media_path derives it automatically."
 	}

@@ -1644,6 +1644,10 @@ type SendMessageRequest struct {
 	QuotedParticipant string `json:"quoted_participant,omitempty"`
 	// Forward: mark the outgoing message as forwarded.
 	IsForwarded bool `json:"is_forwarded,omitempty"`
+	// SendAs picks a special presentation for media: "gif" sends an MP4 as a
+	// looping, muted WhatsApp GIF (GifPlayback); "sticker" sends a WebP (static
+	// or animated) as a sticker. Empty or "media" keeps the normal send.
+	SendAs string `json:"send_as,omitempty"`
 	// NoDelay skips the humanized pre-send typing delay for this message. Set by
 	// interactive callers (the admin composer, where a human already spent time
 	// typing) so the operator isn't made to wait again. Automated/API sends leave
@@ -1771,7 +1775,7 @@ func holdWithTyping(client *whatsmeow.Client, jid types.JID, d time.Duration) {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, mediaBase64 string, mediaFilename string, mediaMimetype string, mentionedJIDs []string, quotedID string, quotedText string, quotedParticipant string, isForwarded bool, noDelay bool) (bool, string, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, mediaBase64 string, mediaFilename string, mediaMimetype string, mentionedJIDs []string, quotedID string, quotedText string, quotedParticipant string, isForwarded bool, noDelay bool, sendAs string) (bool, string, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp", ""
 	}
@@ -1915,6 +1919,9 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		if mediaType == whatsmeow.MediaAudio {
 			mimeType = normalizeVoiceNoteMimetype(mimeType)
 		}
+		if errMsg := checkSendAs(sendAs, mediaType, mimeType, mediaData, message); errMsg != "" {
+			return false, errMsg, ""
+		}
 
 		resp, err := client.Upload(context.Background(), mediaData, mediaType)
 		if err != nil {
@@ -1923,8 +1930,24 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 
 		slog.Info("media uploaded", "response", resp)
 
-		switch mediaType {
-		case whatsmeow.MediaImage:
+		switch {
+		case sendAs == "sticker":
+			w, h, animated := webpInfo(mediaData)
+			msg.StickerMessage = &waE2E.StickerMessage{
+				Mimetype:      proto.String("image/webp"),
+				URL:           &resp.URL,
+				DirectPath:    &resp.DirectPath,
+				MediaKey:      resp.MediaKey,
+				FileEncSHA256: resp.FileEncSHA256,
+				FileSHA256:    resp.FileSHA256,
+				FileLength:    &resp.FileLength,
+				IsAnimated:    proto.Bool(animated),
+			}
+			if w > 0 && h > 0 {
+				msg.StickerMessage.Width = proto.Uint32(w)
+				msg.StickerMessage.Height = proto.Uint32(h)
+			}
+		case mediaType == whatsmeow.MediaImage:
 			msg.ImageMessage = &waE2E.ImageMessage{
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
@@ -1935,7 +1958,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 				FileSHA256:    resp.FileSHA256,
 				FileLength:    &resp.FileLength,
 			}
-		case whatsmeow.MediaAudio:
+		case mediaType == whatsmeow.MediaAudio:
 			var seconds uint32 = 30
 			var waveform []byte = nil
 
@@ -1963,7 +1986,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 				PTT:           proto.Bool(true),
 				Waveform:      waveform,
 			}
-		case whatsmeow.MediaVideo:
+		case mediaType == whatsmeow.MediaVideo:
 			msg.VideoMessage = &waE2E.VideoMessage{
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
@@ -1974,7 +1997,10 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 				FileSHA256:    resp.FileSHA256,
 				FileLength:    &resp.FileLength,
 			}
-		case whatsmeow.MediaDocument:
+			if sendAs == "gif" {
+				msg.VideoMessage.GifPlayback = proto.Bool(true)
+			}
+		case mediaType == whatsmeow.MediaDocument:
 			// filepath.Base handles Windows separators too; slicing on "/" left
 			// the whole path as the document name for callers on Windows.
 			docName := filepath.Base(mediaPath)
@@ -2005,6 +2031,9 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		switch mediaType {
 		case whatsmeow.MediaImage:
 			stMediaType = "image"
+			if sendAs == "sticker" {
+				stMediaType = "sticker"
+			}
 		case whatsmeow.MediaVideo:
 			stMediaType = "video"
 		case whatsmeow.MediaAudio:
@@ -2032,6 +2061,8 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 			msg.DocumentMessage.ContextInfo = ctxInfo
 		case msg.AudioMessage != nil:
 			msg.AudioMessage.ContextInfo = ctxInfo
+		case msg.StickerMessage != nil:
+			msg.StickerMessage.ContextInfo = ctxInfo
 		}
 	}
 
@@ -3843,7 +3874,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 			}
 		}
 
-		success, message, sentID := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath, req.MediaBase64, req.MediaFilename, req.MediaMimetype, req.MentionedJIDs, req.QuotedID, req.QuotedText, req.QuotedParticipant, req.IsForwarded, req.NoDelay)
+		success, message, sentID := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath, req.MediaBase64, req.MediaFilename, req.MediaMimetype, req.MentionedJIDs, req.QuotedID, req.QuotedText, req.QuotedParticipant, req.IsForwarded, req.NoDelay, req.SendAs)
 		var reason string
 		if !success {
 			// Decode known WhatsApp nack codes (463 = reachout time-lock, 479 =
