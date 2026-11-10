@@ -4042,6 +4042,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 			for _, name := range []appstate.WAPatchName{appstate.WAPatchRegular, appstate.WAPatchRegularHigh, appstate.WAPatchRegularLow} {
 				if err := client.FetchAppState(context.Background(), name, true, false); err != nil {
 					slog.Warn("resync: fetch app state failed", "patch", string(name), "err", err)
+					if errors.Is(err, appstate.ErrMismatchingLTHash) {
+						requestAppStateRecovery(client, name)
+					}
 				}
 			}
 		}()
@@ -4203,7 +4206,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 		defer cancel()
 		if err := client.SendAppState(ctx, appstate.BuildLabelChat(chat, body.LabelID, body.Labeled)); err != nil {
 			slog.Warn("labels: send chat label failed", "chat", chat.String(), "label", body.LabelID, "err", err)
-			respondError(w, http.StatusBadGateway, "WhatsApp rejected the label change: "+err.Error())
+			labelSendFailed(w, client, err)
 			return
 		}
 		if err := messageStore.SetWaChatLabel(chat.String(), body.LabelID, body.Labeled); err != nil {
@@ -4258,7 +4261,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 		defer cancel()
 		if err := client.SendAppState(ctx, appstate.BuildLabelEdit(id, body.Name, body.Color, false)); err != nil {
 			slog.Warn("labels: send label edit failed", "label", id, "err", err)
-			respondError(w, http.StatusBadGateway, "WhatsApp rejected the label change: "+err.Error())
+			labelSendFailed(w, client, err)
 			return
 		}
 		if err := messageStore.UpsertWaLabel(id, body.Name, body.Color, false); err != nil {
@@ -4300,7 +4303,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 			defer cancel()
 			if err := client.SendAppState(ctx, appstate.BuildLabelEdit(id, name, color, true)); err != nil {
 				slog.Warn("labels: send label delete failed", "label", id, "err", err)
-				respondError(w, http.StatusBadGateway, "WhatsApp rejected the label change: "+err.Error())
+				labelSendFailed(w, client, err)
 				return
 			}
 			if err := messageStore.DeleteWaLabel(id); err != nil {
@@ -7098,22 +7101,41 @@ func (store *MessageStore) GetDirectChatByContact(phone string) (*Chat, error) {
 // 15 minutes). A fullSync fetch drops the stored state and takes a fresh
 // snapshot from the server. Server-only: no request to the phone, no history
 // sync, nothing shown on the device.
+//
+// The fresh snapshot is not always enough: the server can hold a patch whose
+// LTHash never matched its own mutations (a device wrote it on a wrong base;
+// the server cannot check, it cannot decrypt). Every fetch then stops at that
+// patch, snapshot or not (prod Nov 2026: BBP Showroom stuck at regular v934 /
+// regular_low v2094, label sends 409 forever). Official companions recover by
+// asking the primary phone for its own copy of the collection, so when the
+// refetch fails the same way we send that recovery request too.
 const appStateResyncGap = time.Hour
 
-var appStateResync = struct {
+type appStateGate struct {
 	sync.Mutex
 	last map[appstate.WAPatchName]time.Time
-}{last: map[appstate.WAPatchName]time.Time{}}
+}
+
+// allow reports whether name may run now, and records the run.
+func (g *appStateGate) allow(name appstate.WAPatchName) bool {
+	g.Lock()
+	defer g.Unlock()
+	if last, ok := g.last[name]; ok && time.Since(last) < appStateResyncGap {
+		return false
+	}
+	g.last[name] = time.Now()
+	return true
+}
+
+var (
+	appStateResync   = &appStateGate{last: map[appstate.WAPatchName]time.Time{}}
+	appStateRecovery = &appStateGate{last: map[appstate.WAPatchName]time.Time{}}
+)
 
 func resyncAppStateCollection(client *whatsmeow.Client, name appstate.WAPatchName) {
-	appStateResync.Lock()
-	if last, ok := appStateResync.last[name]; ok && time.Since(last) < appStateResyncGap {
-		appStateResync.Unlock()
+	if !appStateResync.allow(name) {
 		return
 	}
-	appStateResync.last[name] = time.Now()
-	appStateResync.Unlock()
-
 	// whatsmeow dispatches AppStateSyncError while still holding its app-state
 	// lock, so the refetch has to wait in its own goroutine — run inline it
 	// would deadlock.
@@ -7121,10 +7143,46 @@ func resyncAppStateCollection(client *whatsmeow.Client, name appstate.WAPatchNam
 		slog.Warn("app state hash mismatch; refetching collection from a fresh snapshot", "patch", string(name))
 		if err := client.FetchAppState(context.Background(), name, true, false); err != nil {
 			slog.Error("app state full refetch failed", "patch", string(name), "err", err)
+			if errors.Is(err, appstate.ErrMismatchingLTHash) {
+				requestAppStateRecovery(client, name)
+			}
 			return
 		}
 		slog.Info("app state collection refetched", "patch", string(name))
 	}()
+}
+
+// requestAppStateRecovery asks the primary phone to send its own copy of the
+// collection (a peer message: silent, nothing shown on the phone). whatsmeow
+// applies the answer itself — it replaces the stored version and hash, so the
+// next incremental fetch starts past the broken patch — and emits
+// AppStateSyncComplete{Recovery: true}. A phone that is offline answers once it
+// comes back. At most once per collection per appStateResyncGap.
+func requestAppStateRecovery(client *whatsmeow.Client, name appstate.WAPatchName) {
+	if !appStateRecovery.allow(name) {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if _, err := client.SendPeerMessage(ctx, whatsmeow.BuildAppStateRecoveryRequest(name)); err != nil {
+			slog.Error("app state recovery request failed", "patch", string(name), "err", err)
+			return
+		}
+		slog.Warn("app state recovery requested from the phone", "patch", string(name))
+	}()
+}
+
+// labelSendFailed answers a failed label SendAppState. A hash mismatch means
+// the collection is stuck (see requestAppStateRecovery): ask the phone for a
+// fresh copy and tell the caller to retry once it has arrived.
+func labelSendFailed(w http.ResponseWriter, client *whatsmeow.Client, err error) {
+	if errors.Is(err, appstate.ErrMismatchingLTHash) {
+		requestAppStateRecovery(client, appstate.WAPatchRegular)
+		respondError(w, http.StatusServiceUnavailable, "Label sync with the phone is being repaired. Keep the phone online and try again in a minute.")
+		return
+	}
+	respondError(w, http.StatusBadGateway, "WhatsApp rejected the label change: "+err.Error())
 }
 
 func main() {
@@ -7354,6 +7412,11 @@ func main() {
 			// fetch is not retried from here, so this can never loop on itself.
 			if !v.FullSync && errors.Is(v.Error, appstate.ErrMismatchingLTHash) {
 				resyncAppStateCollection(client, v.Name)
+			}
+
+		case *events.AppStateSyncComplete:
+			if v.Recovery {
+				slog.Info("app state recovered from the phone", "patch", string(v.Name), "version", v.Version)
 			}
 
 		case *events.MediaRetry:
