@@ -3420,11 +3420,14 @@ var pendingMediaRetries sync.Map // string (message ID) -> *mediaRetryWaiter
 const mediaRetryTimeout = 30 * time.Second
 
 // isExpiredMediaErr reports whether a download failure means the encrypted
-// blob is gone from WhatsApp's CDN, which a media retry receipt can fix.
+// blob is gone from WhatsApp's CDN, or the blob the CDN served does not match
+// the message's media key (invalid HMAC). Either way a media retry receipt can
+// make the sender's device re-upload a fresh copy, so both trigger the retry.
 func isExpiredMediaErr(err error) bool {
 	return errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith403) ||
 		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith404) ||
-		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410)
+		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410) ||
+		errors.Is(err, whatsmeow.ErrInvalidMediaHMAC)
 }
 
 // retryExpiredMedia handles expired CDN media: it sends a media retry receipt
