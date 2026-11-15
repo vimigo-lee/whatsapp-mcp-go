@@ -7573,10 +7573,7 @@ func main() {
 				}
 			}
 		} else {
-			if err := client.Connect(); err != nil {
-				logger.Errorf("Failed to connect: %v", err)
-				return
-			}
+			connectLinkedWithRetry(client, logger)
 		}
 	}()
 
@@ -7589,4 +7586,38 @@ func main() {
 
 	fmt.Println("Disconnecting...")
 	client.Disconnect()
+}
+
+// First-connect retry backoff for a linked session: 5s, 10s, 20s, 40s, then
+// every minute.
+const (
+	firstConnectBackoff    = 5 * time.Second
+	firstConnectBackoffMax = time.Minute
+)
+
+// connectLinkedWithRetry dials WhatsApp for an already-linked session until the
+// websocket comes up. whatsmeow's auto-reconnect only covers a connection that
+// once came up, so a first dial that fails (a proxy timeout, a network blip)
+// used to leave the bridge idle and the line offline until the process was
+// restarted (15 Nov 2026: six lines stayed down for two hours after a worker
+// restart during a Bright Data outage). It stops once connected, or when the
+// session is gone (logged out), which retrying cannot fix.
+func connectLinkedWithRetry(client *whatsmeow.Client, logger waLog.Logger) {
+	backoff := firstConnectBackoff
+	for attempt := 1; ; attempt++ {
+		err := client.Connect()
+		if err == nil || errors.Is(err, whatsmeow.ErrAlreadyConnected) {
+			if attempt > 1 {
+				logger.Infof("Connected on attempt %d", attempt)
+			}
+			return
+		}
+		if client.Store.ID == nil {
+			logger.Errorf("Failed to connect: %v (session gone, not retrying)", err)
+			return
+		}
+		logger.Errorf("Failed to connect (attempt %d), retrying in %s: %v", attempt, backoff, err)
+		time.Sleep(backoff)
+		backoff = min(backoff*2, firstConnectBackoffMax)
+	}
 }
