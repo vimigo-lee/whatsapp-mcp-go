@@ -145,6 +145,10 @@ type Message struct {
 
 type MessageStore struct {
 	db *sql.DB
+	// contactsDB holds whatsmeow's own tables (whatsmeow_contacts etc.).
+	// With Postgres it is the same database as db; with SQLite whatsmeow
+	// keeps them in a separate file, store/whatsapp.db, opened read-only.
+	contactsDB *sql.DB
 }
 
 var isPostgres = false
@@ -274,6 +278,14 @@ func validateMediaPath(mediaPath string) (string, error) {
 	}
 
 	return absPath, nil
+}
+
+// openContactsDB returns the database that holds whatsmeow's tables.
+func openContactsDB(db *sql.DB) (*sql.DB, error) {
+	if isPostgres {
+		return db, nil
+	}
+	return sql.Open("sqlite3", "file:store/whatsapp.db?mode=ro&_busy_timeout=5000")
 }
 
 // NewMessageStore Initialize message store
@@ -481,11 +493,19 @@ func NewMessageStore() (*MessageStore, error) {
 		_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS messages_file_sha256_idx ON messages (file_sha256)`)
 	}
 
-	return &MessageStore{db: db}, nil
+	contactsDB, err := openContactsDB(db)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open contacts database: %v", err)
+	}
+
+	return &MessageStore{db: db, contactsDB: contactsDB}, nil
 }
 
 // Close the database connection
 func (store *MessageStore) Close() error {
+	if store.contactsDB != nil && store.contactsDB != store.db {
+		_ = store.contactsDB.Close()
+	}
 	return store.db.Close()
 }
 
@@ -6770,7 +6790,7 @@ func (store *MessageStore) SearchContacts(query string) ([]Contact, error) {
 		return nil, nil
 	}
 
-	rows, err := store.db.Query(`
+	rows, err := store.contactsDB.Query(`
         SELECT c.their_jid, c.first_name, c.full_name, c.push_name, c.business_name, u.username
         FROM whatsmeow_contacts c
         LEFT JOIN contact_usernames u ON u.jid = c.their_jid
