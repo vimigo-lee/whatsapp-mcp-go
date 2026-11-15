@@ -833,7 +833,7 @@ func getContactChatsHandler(
 		return ErrResult("failed to parse chats response"), nil, nil
 	}
 
-	return &mcp.CallToolResult{}, result.Chats, nil
+	return OkResult(map[string]any{"chats": result.Chats, "count": result.Count}), nil, nil
 }
 
 func getLastInteractionHandler(
