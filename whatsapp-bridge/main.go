@@ -55,6 +55,7 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
+	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/proto/waMmsRetry"
@@ -1233,15 +1234,15 @@ func (store *MessageStore) IncrementUnread(jid string) error {
 // recent incoming message in a chat — the message to send a read receipt for so
 // WhatsApp clears the chat's unread state. ok is false when the chat has no
 // incoming message (nothing to mark read).
-func (store *MessageStore) LatestIncoming(chatJID string) (id string, sender string, ok bool) {
-	q := "SELECT id, sender FROM messages WHERE chat_jid = ? AND is_from_me = 0 ORDER BY timestamp DESC LIMIT 1"
+func (store *MessageStore) LatestIncoming(chatJID string) (id string, sender string, ts time.Time, ok bool) {
+	q := "SELECT id, sender, timestamp FROM messages WHERE chat_jid = ? AND is_from_me = 0 ORDER BY timestamp DESC LIMIT 1"
 	if isPostgres {
-		q = "SELECT id, sender FROM messages WHERE chat_jid = $1 AND is_from_me = false ORDER BY timestamp DESC LIMIT 1"
+		q = "SELECT id, sender, timestamp FROM messages WHERE chat_jid = $1 AND is_from_me = false ORDER BY timestamp DESC LIMIT 1"
 	}
-	if err := store.db.QueryRow(q, chatJID).Scan(&id, &sender); err != nil {
-		return "", "", false
+	if err := store.db.QueryRow(q, chatJID).Scan(&id, &sender, &ts); err != nil {
+		return "", "", time.Time{}, false
 	}
-	return id, sender, id != ""
+	return id, sender, ts, id != ""
 }
 
 
@@ -4162,13 +4163,28 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 		// Send the read receipt to WhatsApp so the phone (and the sender's ticks)
 		// mirror it. Needs a concrete message ID + its sender; skip quietly if the
 		// chat holds no incoming message or we're offline.
-		if id, senderUser, ok := messageStore.LatestIncoming(chat.String()); ok && client.IsConnected() {
+		if id, senderUser, ts, ok := messageStore.LatestIncoming(chat.String()); ok && client.IsConnected() {
 			var sender types.JID
 			if chat.Server == types.GroupServer {
 				sender = types.NewJID(senderUser, types.DefaultUserServer)
 			}
 			if err := client.MarkRead(context.Background(), []types.MessageID{id}, time.Now(), chat, sender); err != nil {
 				slog.Warn("mark-read: send receipt failed", "chat", chat.String(), "err", err)
+			}
+			// A receipt does not clear the phone's own unread flag. WhatsApp keeps
+			// that flag in app state (MarkChatAsRead), so without this patch the
+			// phone still counts the chat as unread, and the next history sync or
+			// reconnect seeds the badge back from it.
+			key := &waCommon.MessageKey{
+				RemoteJID: proto.String(chat.String()),
+				FromMe:    proto.Bool(false),
+				ID:        proto.String(string(id)),
+			}
+			if chat.Server == types.GroupServer {
+				key.Participant = proto.String(sender.String())
+			}
+			if err := client.SendAppState(context.Background(), appstate.BuildMarkChatAsRead(chat, true, ts, key)); err != nil {
+				slog.Warn("mark-read: app-state patch failed", "chat", chat.String(), "err", err)
 			}
 		}
 		respondJSON(w, http.StatusOK, map[string]bool{"ok": true})
