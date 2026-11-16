@@ -1062,6 +1062,21 @@ func (store *MessageStore) SetUnreadCount(jid string, count int) error {
 	return err
 }
 
+// ClearUnread zeroes a chat's unread counter and reports whether it was above
+// zero. One conditional UPDATE, so of two concurrent clears only one sees true.
+func (store *MessageStore) ClearUnread(jid string) (bool, error) {
+	q := "UPDATE chats SET unread_count = 0 WHERE jid = ? AND unread_count > 0"
+	if isPostgres {
+		q = "UPDATE chats SET unread_count = 0 WHERE jid = $1 AND unread_count > 0"
+	}
+	res, err := store.db.Exec(q, jid)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
 // markReceipt stamps a receipt column (delivered_at | read_at) on our OUTGOING
 // messages once the recipient's receipt arrives, so the chat UI can render the
 // grey→blue tick. Scoped to is_from_me rows so an incoming message never gets a
@@ -4157,7 +4172,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 		}
 		// Clear the local badge unconditionally — the operator has seen the chat
 		// in the manager regardless of whether we can send a receipt upstream.
-		if err := messageStore.SetUnreadCount(chat.String(), 0); err != nil {
+		wasUnread, err := messageStore.ClearUnread(chat.String())
+		if err != nil {
 			slog.Warn("mark-read: clear unread failed", "chat", chat.String(), "err", err)
 		}
 		// Send the read receipt to WhatsApp so the phone (and the sender's ticks)
@@ -4174,17 +4190,19 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 			// A receipt does not clear the phone's own unread flag. WhatsApp keeps
 			// that flag in app state (MarkChatAsRead), so without this patch the
 			// phone still counts the chat as unread, and the next history sync or
-			// reconnect seeds the badge back from it.
-			key := &waCommon.MessageKey{
-				RemoteJID: proto.String(chat.String()),
-				FromMe:    proto.Bool(false),
-				ID:        proto.String(string(id)),
-			}
-			if chat.Server == types.GroupServer {
-				key.Participant = proto.String(sender.String())
-			}
-			if err := client.SendAppState(context.Background(), appstate.BuildMarkChatAsRead(chat, true, ts, key)); err != nil {
-				slog.Warn("mark-read: app-state patch failed", "chat", chat.String(), "err", err)
+			// reconnect seeds the badge back from it. The manager calls this on
+			// every chat open, so only a chat that was unread gets the patch, the
+			// way WhatsApp Web does: one app-state write per real read.
+			if wasUnread {
+				key := &waCommon.MessageKey{
+					RemoteJID: proto.String(chat.String()),
+					FromMe:    proto.Bool(false),
+					ID:        proto.String(string(id)),
+				}
+				if chat.Server == types.GroupServer {
+					key.Participant = proto.String(sender.String())
+				}
+				go sendMarkChatRead(client, chat, ts, key)
 			}
 		}
 		respondJSON(w, http.StatusOK, map[string]bool{"ok": true})
@@ -7210,6 +7228,31 @@ func requestAppStateRecovery(client *whatsmeow.Client, name appstate.WAPatchName
 		}
 		slog.Warn("app state recovery requested from the phone", "patch", string(name))
 	}()
+}
+
+// markReadPatchMu sends one mark-read patch at a time. Each app-state write is
+// encoded against the collection's current version, so two concurrent writes
+// from this device would race for the same version.
+var markReadPatchMu sync.Mutex
+
+// sendMarkChatRead clears the phone's unread flag for one chat. It runs off the
+// request so the manager's call never waits on the app-state round trip. A
+// failure leaves the phone's flag set: the next history sync or reconnect brings
+// the badge back, and opening the chat then sends the patch again.
+func sendMarkChatRead(client *whatsmeow.Client, chat types.JID, ts time.Time, key *waCommon.MessageKey) {
+	markReadPatchMu.Lock()
+	defer markReadPatchMu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	err := client.SendAppState(ctx, appstate.BuildMarkChatAsRead(chat, true, ts, key))
+	if err == nil {
+		return
+	}
+	slog.Warn("mark-read: app-state patch failed", "chat", chat.String(), "err", err)
+	if errors.Is(err, appstate.ErrMismatchingLTHash) {
+		// Same stuck-collection case as labels: ask the phone for a fresh copy.
+		requestAppStateRecovery(client, appstate.WAPatchRegularLow)
+	}
 }
 
 // labelSendFailed answers a failed label SendAppState. A hash mismatch means
