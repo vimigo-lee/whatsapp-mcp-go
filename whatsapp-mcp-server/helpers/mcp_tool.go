@@ -212,9 +212,14 @@ func InitMcpTool() {
 		addr := ReadEnv("HTTP_BASE_URL", "0.0.0.0:5777")
 		slog.Info("Starting WhatsApp MCP HTTP streaming", "addr", addr)
 
+		// Stateless: every tool is plain request/response, so no session is
+		// needed. It is also the only mode that serves MCP 2026-07-28, and it
+		// keeps older clients working with no session to lose on a restart.
+		// The SDK's 4 MiB default body cap would refuse upload_media base64
+		// that the hosted proxies (24 MiB) let through.
 		mcpHandler := mcp.NewStreamableHTTPHandler(func(req *http.Request) *mcp.Server {
 			return server
-		}, nil)
+		}, &mcp.StreamableHTTPOptions{Stateless: true, MaxRequestBodyBytes: maxMCPRequestBytes})
 		var handler http.Handler
 		if token != "" {
 			handler = requireBearerToken(token, mcpHandler)
@@ -227,11 +232,16 @@ func InitMcpTool() {
 		}
 	} else {
 		slog.Info("Starting WhatsApp MCP server in stdio mode")
-		if err := server.Run(ctx, &mcp.StdioTransport{}); err != nil {
+		if err := server.Run(ctx, &mcp.StdioTransport{MaxLineLength: maxMCPRequestBytes}); err != nil {
 			log.Fatalf("stdio failed: %v", err)
 		}
 	}
 }
+
+// maxMCPRequestBytes is the largest JSON-RPC message accepted on either
+// transport. A base64 upload_media is the big one; 24 MiB matches the cap the
+// hosted proxies already enforce in front of this server.
+const maxMCPRequestBytes = 24 << 20
 
 // mcpReadHeaderTimeout bounds how long a client may take to send its request
 // headers; a variable so tests can shorten it.
