@@ -2737,6 +2737,9 @@ func handleGroupInfoEvent(client *whatsmeow.Client, evt *events.GroupInfo, logge
 			"demote":      nums(evt.Demote),
 			"join_reason": evt.JoinReason,
 		}
+		if len(evt.Join) > 0 {
+			payload["join_participants"] = joinParticipants(client, evt.Join)
+		}
 		if evt.Sender != nil {
 			payload["sender"] = normalizeUserJID(client, *evt.Sender).User
 		}
@@ -2750,6 +2753,41 @@ func handleGroupInfoEvent(client *whatsmeow.Client, evt *events.GroupInfo, logge
 			slog.Warn("group webhook delivery failed after retries", "group", evt.JID.String(), "error", err)
 		}
 	}()
+}
+
+// joinParticipants gives both addresses of each member who just joined a group,
+// in the shape of the group-info roster: "phone_number" is the bare number and
+// "lid" the full @lid JID. The join event names a member by one address only,
+// so the other comes from the stored LID mapping and is "" when WhatsApp has
+// not told us it (a hidden number, or a contact never seen before).
+func joinParticipants(client *whatsmeow.Client, jids []types.JID) []map[string]string {
+	out := make([]map[string]string, 0, len(jids))
+	for _, j := range jids {
+		j = j.ToNonAD()
+		var pn, lid types.JID
+		if j.Server == types.HiddenUserServer {
+			lid = j
+		} else {
+			pn = j
+		}
+		if client != nil && client.Store != nil && client.Store.LIDs != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			if pn.IsEmpty() {
+				if found, err := client.Store.LIDs.GetPNForLID(ctx, lid); err == nil {
+					pn = found
+				}
+			} else if found, err := client.Store.LIDs.GetLIDForPN(ctx, pn); err == nil {
+				lid = found
+			}
+			cancel()
+		}
+		p := map[string]string{"phone_number": pn.User, "lid": ""}
+		if !lid.IsEmpty() {
+			p["lid"] = lid.String()
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
 // Webhook deliveries are started by whoever messages the number, so each one
