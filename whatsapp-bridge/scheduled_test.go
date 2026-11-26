@@ -13,6 +13,7 @@ import (
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -499,10 +500,10 @@ func TestHandleScheduledIncoming(t *testing.T) {
 		e.Info.ID, e.Info.IsFromMe, e.Info.Timestamp = id, fromMe, time.Date(2026, 11, 26, 16, 0, 0, 0, time.Local)
 		return e
 	}
-	if !handleScheduledIncoming(store, evt("PHONE", true, cr), chat, "me") {
+	if !handleScheduledIncoming(nil, store, evt("PHONE", true, cr), chat, "me", waLog.Noop) {
 		t.Fatal("own scheduled message not handled")
 	}
-	if !handleScheduledIncoming(store, evt("THEIRS", false, cr), chat, "60222") {
+	if !handleScheduledIncoming(nil, store, evt("THEIRS", false, cr), chat, "60222", waLog.Noop) {
 		t.Fatal("their scheduled message not handled")
 	}
 	var c string
@@ -518,14 +519,14 @@ func TestHandleScheduledIncoming(t *testing.T) {
 		Key:  &waCommon.MessageKey{ID: proto.String("PHONE"), FromMe: proto.Bool(true)},
 		Type: waE2E.ProtocolMessage_MESSAGE_UNSCHEDULE.Enum(),
 	}}
-	if !handleScheduledIncoming(store, evt("U1", true, unschedule), chat, "me") {
+	if !handleScheduledIncoming(nil, store, evt("U1", true, unschedule), chat, "me", waLog.Noop) {
 		t.Fatal("unschedule not handled")
 	}
 	store.db.QueryRow(`SELECT content FROM messages WHERE id = 'PHONE'`).Scan(&c)
 	if c != scheduledCancelledMarker {
 		t.Errorf("after cancel = %q", c)
 	}
-	if handleScheduledIncoming(store, evt("T", false, &waE2E.Message{Conversation: proto.String("hi")}), chat, "60222") {
+	if handleScheduledIncoming(nil, store, evt("T", false, &waE2E.Message{Conversation: proto.String("hi")}), chat, "60222", waLog.Noop) {
 		t.Error("plain text treated as scheduled")
 	}
 }

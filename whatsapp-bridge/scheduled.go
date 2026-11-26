@@ -52,6 +52,12 @@ const (
 	scheduledStatusPending   = "scheduled"
 	scheduledStatusCancelled = "cancelled"
 	scheduledStatusPosted    = "posted" // its time passed; WhatsApp's server delivered it (not confirmed)
+	scheduledStatusFailed    = "failed" // WhatsApp said it could not deliver it (post notification)
+
+	// Where a scheduled_messages row came from: sent from this bridge, or
+	// scheduled on the owner's phone (seen with its key on this device).
+	scheduledSourceBridge = "bridge"
+	scheduledSourcePhone  = "phone"
 )
 
 // errScheduleWindow is returned for a time WhatsApp will not take.
@@ -251,8 +257,10 @@ type ScheduledMessage struct {
 	ScheduledAt time.Time `json:"scheduled_at"`
 	Status      string    `json:"status"`
 	CreatedAt   time.Time `json:"created_at"`
-	KeyID       string    `json:"-"`
-	RevealKey   []byte    `json:"-"`
+	// Source: "bridge" (sent from here) or "phone" (scheduled on the phone).
+	Source    string `json:"source"`
+	KeyID     string `json:"-"`
+	RevealKey []byte `json:"-"`
 }
 
 // ensureScheduledTable creates the scheduled_messages table. The reveal key
@@ -276,7 +284,16 @@ func ensureScheduledTable(db *sql.DB, blobType string) error {
 		);
 		CREATE INDEX IF NOT EXISTS scheduled_messages_due_idx ON scheduled_messages (status, scheduled_at);
 	`, blobType))
-	return err
+	if err != nil {
+		return err
+	}
+	// source came with phone-scheduled rows; older rows are the bridge's own.
+	if isPostgres {
+		_, _ = db.Exec(`ALTER TABLE scheduled_messages ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'bridge'`)
+	} else {
+		_, _ = db.Exec(`ALTER TABLE scheduled_messages ADD COLUMN source TEXT NOT NULL DEFAULT 'bridge'`)
+	}
+	return ensureIncomingScheduledTable(db, blobType)
 }
 
 // The bridge binds times as time.Local wall clock (Postgres TIMESTAMP drops
@@ -295,10 +312,15 @@ func storedLocal(t time.Time) time.Time {
 
 func (store *MessageStore) SaveScheduledMessage(m ScheduledMessage, sender string) error {
 	now := time.Now().In(time.Local)
+	if m.Source == "" {
+		m.Source = scheduledSourceBridge
+	}
+	// A phone-scheduled copy can arrive again (offline replay): keep the first.
 	_, err := store.db.Exec(pgPlaceholders(`INSERT INTO scheduled_messages
-		(id, chat_jid, content, sender, reveal_key_id, reveal_key, scheduled_at, status, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
-		m.ID, m.ChatJID, m.Content, sender, m.KeyID, m.RevealKey, m.ScheduledAt.In(time.Local), scheduledStatusPending, now, now)
+		(id, chat_jid, content, sender, reveal_key_id, reveal_key, scheduled_at, status, created_at, updated_at, source)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (id, chat_jid) DO NOTHING`),
+		m.ID, m.ChatJID, m.Content, sender, m.KeyID, m.RevealKey, m.ScheduledAt.In(time.Local), scheduledStatusPending, now, now, m.Source)
 	return err
 }
 
@@ -323,7 +345,7 @@ func (store *MessageStore) GetScheduledMessage(chatJID, id string) (ScheduledMes
 // ListScheduledMessages lists rows, soonest first; chatJID and status filter
 // when set.
 func (store *MessageStore) ListScheduledMessages(chatJID, status string) ([]ScheduledMessage, error) {
-	q := `SELECT id, chat_jid, content, scheduled_at, status, created_at FROM scheduled_messages WHERE 1 = 1`
+	q := `SELECT id, chat_jid, content, scheduled_at, status, created_at, source FROM scheduled_messages WHERE 1 = 1`
 	var args []any
 	if chatJID != "" {
 		q += ` AND chat_jid = ?`
@@ -341,7 +363,7 @@ func (store *MessageStore) ListScheduledMessages(chatJID, status string) ([]Sche
 	out := []ScheduledMessage{}
 	for rows.Next() {
 		var m ScheduledMessage
-		if err := rows.Scan(&m.ID, &m.ChatJID, &m.Content, &m.ScheduledAt, &m.Status, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.ChatJID, &m.Content, &m.ScheduledAt, &m.Status, &m.CreatedAt, &m.Source); err != nil {
 			return nil, err
 		}
 		m.ScheduledAt, m.CreatedAt = storedLocal(m.ScheduledAt), storedLocal(m.CreatedAt)
@@ -362,8 +384,10 @@ func (store *MessageStore) SetScheduledStatus(chatJID, id, from, to string) (boo
 // never echoes them back to the sending device, so this is how they reach
 // list_messages. It returns how many it moved.
 func (store *MessageStore) PostDueScheduled(now time.Time) (int, error) {
+	// Phone-scheduled rows are not posted here: their message comes in through
+	// the reveal (scheduled_reveal.go), with its real content.
 	rows, err := store.db.Query(pgPlaceholders(`SELECT id, chat_jid, content, sender, scheduled_at FROM scheduled_messages
-		WHERE status = ? AND scheduled_at <= ?`), scheduledStatusPending, now.In(time.Local))
+		WHERE status = ? AND scheduled_at <= ? AND source = ?`), scheduledStatusPending, now.In(time.Local), scheduledSourceBridge)
 	if err != nil {
 		return 0, err
 	}
@@ -549,6 +573,7 @@ func registerScheduledRoutes(ctx context.Context, apiMux *http.ServeMux, client 
 			slog.Warn("cancelled scheduled message but could not mark it", "id", row.ID, "error", err)
 		}
 		store.markScheduledCancelled(chat.String(), row.ID, row.ScheduledAt)
+		store.cancelIncomingByMsg(chat.String(), row.ID)
 		slog.Info("scheduled message cancelled", "id", row.ID, "chat", chat.String())
 		respondJSON(w, http.StatusOK, map[string]any{"success": true})
 	})
@@ -691,32 +716,78 @@ func (store *MessageStore) markScheduledCancelled(chatJID, id string, at time.Ti
 }
 
 // handleScheduledIncoming handles a ConditionalRevealMessage or a
-// MESSAGE_UNSCHEDULE that came in, and reports whether it did:
-//   - our own (scheduled on the owner's phone or another linked device):
-//     a pending notice row, without a time;
-//   - someone else's scheduled message: nothing (WhatsApp shows recipients
-//     nothing until the reveal, which this bridge cannot see yet: the server
-//     sends the key in a mex notification whatsmeow drops);
-//   - a cancel of our own: the notice row becomes a cancelled one.
-func handleScheduledIncoming(store *MessageStore, msg *events.Message, chatJID, sender string) bool {
+// MESSAGE_UNSCHEDULE that came in, and reports whether it did. Every sealed
+// message is kept in scheduled_incoming until its key is here
+// (scheduled_reveal.go):
+//   - our own, scheduled on the owner's phone or another linked device: the
+//     stanza carries the key and time (patched whatsmeow), so it also gets a
+//     scheduled_messages row (the chat desk's list, and cancel) and a notice
+//     with its time and text; without them (stock whatsmeow) a bare notice;
+//   - someone else's: nothing shows (WhatsApp shows recipients nothing until
+//     the reveal); revealed when the key arrives, or now if it already has;
+//   - a cancel: the notice turns cancelled, and the message is never revealed.
+func handleScheduledIncoming(client *whatsmeow.Client, store *MessageStore, msg *events.Message, chatJID, sender string, logger waLog.Logger) bool {
 	m := unwrapMessage(msg.Message)
 	if cr := m.GetConditionalRevealMessage(); cr != nil {
-		if msg.Info.IsFromMe && store != nil {
-			if err := store.StoreMessage(msg.Info.ID, chatJID, sender, scheduledMarker, msg.Info.Timestamp, true,
+		keyID := cr.GetRevealKeyID()
+		metaKeyID, key, at := scheduledMetaOf(msg)
+		if metaKeyID != "" && metaKeyID != keyID {
+			slog.Warn("scheduled message key id differs from its stanza's", "id", msg.Info.ID, "message", keyID, "stanza", metaKeyID)
+			key = nil
+		}
+		if store == nil || keyID == "" {
+			return true
+		}
+		payload, err := proto.Marshal(&waE2E.Message{ConditionalRevealMessage: cr})
+		if err != nil {
+			slog.Warn("could not keep scheduled message", "id", msg.Info.ID, "error", err)
+			return true
+		}
+		if err := store.saveIncomingCiphertext(incomingScheduled{
+			KeyID: keyID, MsgID: msg.Info.ID, ChatJID: chatJID, SenderJID: msg.Info.Sender.String(),
+			PushName: msg.Info.PushName, IsFromMe: msg.Info.IsFromMe, IsGroup: msg.Info.IsGroup,
+			Payload: payload, RevealKey: key, ScheduledAt: at,
+		}); err != nil {
+			slog.Warn("could not keep scheduled message", "id", msg.Info.ID, "error", err)
+		}
+		if msg.Info.IsFromMe {
+			text := ""
+			if len(key) == revealKeyLen {
+				if inner, err := openScheduledMessage(cr, key); err == nil {
+					text = extractTextContent(inner)
+				} else {
+					slog.Warn("own scheduled message does not open with its key", "id", msg.Info.ID, "error", err)
+				}
+				if !at.IsZero() {
+					if err := store.SaveScheduledMessage(ScheduledMessage{
+						ID: msg.Info.ID, ChatJID: chatJID, Content: text, ScheduledAt: at,
+						Source: scheduledSourcePhone, KeyID: keyID, RevealKey: key,
+					}, sender); err != nil {
+						slog.Warn("could not list phone-scheduled message", "id", msg.Info.ID, "error", err)
+					}
+				}
+			}
+			if err := store.StoreMessage(msg.Info.ID, chatJID, sender, scheduledNotice(scheduledMarker, at, text), msg.Info.Timestamp, true,
 				"", "", "", "", nil, nil, nil, 0, "", "", "", false); err != nil {
 				slog.Warn("could not store scheduled notice", "id", msg.Info.ID, "error", err)
 			}
+		} else {
+			// The key can beat the ciphertext here (offline replay).
+			revealIncoming(client, store, keyID, logger)
 		}
 		slog.Info("scheduled message received", "id", msg.Info.ID, "chat", chatJID, "from_me", msg.Info.IsFromMe,
-			"reveal_key_id", cr.GetRevealKeyID())
+			"reveal_key_id", keyID, "key_here", len(key) > 0, "at", at)
 		return true
 	}
 	if pm := m.GetProtocolMessage(); pm != nil && pm.GetType() == waE2E.ProtocolMessage_MESSAGE_UNSCHEDULE {
 		target := pm.GetKey().GetID()
-		if msg.Info.IsFromMe && target != "" && store != nil {
-			store.markScheduledCancelled(chatJID, target, time.Time{})
-			if _, err := store.SetScheduledStatus(chatJID, target, scheduledStatusPending, scheduledStatusCancelled); err != nil {
-				slog.Warn("could not mark scheduled message cancelled", "id", target, "error", err)
+		if target != "" && store != nil {
+			store.cancelIncomingByMsg(chatJID, target)
+			if msg.Info.IsFromMe {
+				store.markScheduledCancelled(chatJID, target, time.Time{})
+				if _, err := store.SetScheduledStatus(chatJID, target, scheduledStatusPending, scheduledStatusCancelled); err != nil {
+					slog.Warn("could not mark scheduled message cancelled", "id", target, "error", err)
+				}
 			}
 		}
 		slog.Info("scheduled message cancelled by sender", "id", target, "chat", chatJID, "from_me", msg.Info.IsFromMe)

@@ -206,18 +206,16 @@ at its scheduled time, not its send time.
   `SendRequestExtra.AdditionalNodes = [<meta type="scheduled_message" st><key rkid>key</key></meta>]`. No typing delay.
 - The send is recorded in `scheduled_messages` (id, chat, text, reveal key id and key, time, status
   `scheduled` → `posted` | `cancelled`), not in `messages`. A sweeper (every 30 s) copies each one whose time
-  came into `messages`, timestamped at its scheduled time, and marks it `posted`. "Posted" means only that its
-  time passed: the bridge cannot see WhatsApp's `NotificationScheduledMessagePost` (stock whatsmeow drops unknown
-  `mex` notifications), so a server-side failure is not detected.
+  came into `messages`, timestamped at its scheduled time, and marks it `posted`. With the patched whatsmeow
+  (section 12) a `NotificationScheduledMessagePost` with a failure status marks it `failed` (and the `messages`
+  row failed); on stock whatsmeow "posted" means only that its time passed.
 - `GET /api/scheduled?chat_jid=&status=` lists rows (default `scheduled`, `all` for every status).
 - `POST /api/unschedule {recipient, message_id}` sends `ProtocolMessage MESSAGE_UNSCHEDULE` naming it, with
   `<meta type="scheduled_message"><key rkid/></meta>`, then marks the row `cancelled`. **Sent without `edit="7"`**
   (stock whatsmeow can't set it). If the live test shows the cancel is ignored, the fix is one case in whatsmeow's
   `getEditAttribute` (`ProtocolMessage_MESSAGE_UNSCHEDULE` → `EditAttributeSenderRevoke`).
 - MCP: `send_message.schedule_at`, `list_scheduled_messages`, `cancel_scheduled_message`.
-- Not handled: messages the owner schedules on the phone (the bridge receives them as a
-  `conditionalRevealMessage` with the key in the stanza meta, which the bridge does not parse yet), and incoming
-  scheduled messages from others (shown by the phone at reveal time; the bridge does not store them).
+- Incoming and phone-scheduled messages: see section 12.
 
 Live test checklist (Phase 3): phone lists the message as scheduled; it arrives on time with the bridge stopped;
 recipient sees normal text (not "unsupported"); cancel removes it from the phone's list and the recipient never
@@ -235,3 +233,35 @@ gets it; a reply/mention survives the seal.
   `TIMESTAMP`; `/unschedule` didn't take a bare phone number.
 - Neither wa-lee nor the local bridges log receipts or `mex` notifications at the default level, so the bridge
   side can't confirm delivery; only the recipient's phone could.
+
+## 12. Incoming and phone-scheduled messages (reveal)
+
+Needs the patched whatsmeow (`patches/whatsmeow.patch` in the consumers, build tag `grouphistory`), which adds:
+
+- `events.MexUpdate{Mex, From, Data}`: every `mex` notification whatsmeow has no typed event for, raw JSON
+  included (stock whatsmeow logs and drops them).
+- `types.MsgMetaInfo.ScheduledRevealKeyID / ScheduledRevealKey / ScheduledTime`, parsed from
+  `<meta type="scheduled_message" st=…><key rkid=…>key</key></meta>` on incoming stanzas.
+
+`whatsapp-bridge/scheduled_reveal.go` (+ `scheduled_reveal_patched.go`, the tagged hooks):
+
+- Every sealed `conditionalRevealMessage` that arrives is kept in `scheduled_incoming` (reveal key id, message id,
+  chat, sender, push name, sealed payload, key when known, time, status `pending` → `revealed` | `cancelled`).
+  Nothing shows in `messages` until it opens.
+- **Someone else's**: the key arrives at the scheduled time as mex `NotificationScheduledMessageReveal`
+  (`xwa2_notify_scheduled_message_reveal {chat_jid, rk (url-safe base64), rkid, st, sender_user_jid}`). Key and
+  ciphertext can come in either order (offline replay); whichever lands second triggers the reveal. The message
+  is decrypted, unwrapped and fed through the normal message handler with its original id, sender and the
+  scheduled time, so it is stored, webhooked and shown like any other message. A reveal is claimed once.
+- **The owner's, scheduled on the phone** (or another linked device): the stanza carries the key and time. The
+  bridge lists it in `scheduled_messages` with `source = 'phone'` and its text (so `list_scheduled_messages` and
+  the manager's drawer show it and it can be cancelled from the bridge), stores the usual "scheduled for …"
+  notice, and its own 30 s sweeper does **not** post it. It is revealed by `NotificationScheduledMessagePost`
+  with `SUCCESS`, or, if that never comes, 2 minutes after its time.
+- `MESSAGE_UNSCHEDULE` from the sender (or `/api/unschedule` from us) marks the pending row `cancelled`; it is
+  never revealed.
+- `NotificationScheduledMessagePost` with a failure status marks one of our own scheduled messages `failed`.
+- Reveal runs are recovered from panics; the 30 s sweeper handles the owner's phone-scheduled fallback above.
+
+On stock whatsmeow (no tag) none of the mex/meta hooks exist: incoming sealed messages are still kept, but
+never open, exactly as before.

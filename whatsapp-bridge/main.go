@@ -3038,7 +3038,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 	// Scheduled messages (scheduled.go): a notice row for our own, and a
 	// cancel turns it into a cancelled one; others' wait for their reveal.
-	if handleScheduledIncoming(messageStore, msg, chatJID, sender) {
+	if handleScheduledIncoming(client, messageStore, msg, chatJID, sender, logger) {
 		return
 	}
 
@@ -7600,6 +7600,13 @@ func main() {
 	const maxOutdatedRetries = 3
 	var outdatedRetries int
 	var outdatedRetriesMu sync.Mutex
+
+	// Scheduled messages others sent us, and the owner's phone-scheduled ones,
+	// are revealed from WhatsApp's mex notifications (scheduled_reveal.go);
+	// only a build with the patched whatsmeow can see them.
+	if registerScheduledReveal != nil {
+		registerScheduledReveal(client, messageStore, logger)
+	}
 
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
