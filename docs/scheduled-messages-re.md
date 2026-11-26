@@ -190,6 +190,10 @@ in-place edit.
 2026-11-26: WhatsApp Desktop on Lee's account offers "Schedule message" and accepts a time only 10 or more
 minutes ahead (scheduled 15:21 → 15:31, chat shows "You scheduled a message. Click to view" and lists it under
 "Scheduled messages"). So the sender gate is on for that account and the 10-minute minimum holds.
+At 15:31 the message appeared in the chat as a normal sent text stamped 15:31 with double ticks (delivered),
+and the Scheduled messages panel read "All scheduled messages have been sent or deleted". The "You scheduled a
+message" system bubbles stay in the chat. This matches the bridge's choice to put a posted message into history
+at its scheduled time, not its send time.
 
 ## 10. Implementation in this fork (experimental)
 
