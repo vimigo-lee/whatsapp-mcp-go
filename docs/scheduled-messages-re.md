@@ -1,6 +1,6 @@
 # WhatsApp native scheduled messages: reverse engineering notes
 
-Status: research done; experimental text-only implementation in the bridge (`whatsapp-bridge/scheduled.go`), not yet tested live. No live traffic was captured.
+Status: research done; experimental text-only implementation in the bridge (`whatsapp-bridge/scheduled.go`), live-tested once (§11). No live traffic was captured.
 
 ## TL;DR
 
@@ -222,3 +222,16 @@ at its scheduled time, not its send time.
 Live test checklist (Phase 3): phone lists the message as scheduled; it arrives on time with the bridge stopped;
 recipient sees normal text (not "unsupported"); cancel removes it from the phone's list and the recipient never
 gets it; a reply/mention survives the seal.
+
+## 11. Live test 2026-11-26 (bridge on Joy 60165343717 → Lee 60165420926)
+
+- 16:18:48 `POST /api/send` with `schedule_at` 16:31 → server accepted (no NACK), id `3EB04AFD2045A657597938`,
+  rkid `d9192f71-…`. Bridge stopped at 16:19:19 and stayed off.
+- Lee's phone showed nothing before the time, then received **"Scheduled test 1 (bridge)" as a normal text**
+  after 16:31. Offline delivery by the server: **confirmed**. Joy's account (no Desktop check) can schedule.
+- 16:19:01 test 2 scheduled for 16:33, cancelled 16:19:10 (`MESSAGE_UNSCHEDULE`, `edit="7"`, meta with rkid) → server
+  accepted the cancel. Whether it stayed undelivered: see below.
+- Found and fixed during the test: times bound with an offset other than local were stored wrong in Postgres
+  `TIMESTAMP`; `/unschedule` didn't take a bare phone number.
+- Neither wa-lee nor the local bridges log receipts or `mex` notifications at the default level, so the bridge
+  side can't confirm delivery; only the recipient's phone could.
