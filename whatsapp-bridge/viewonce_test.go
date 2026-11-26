@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
@@ -118,7 +119,7 @@ func TestCheckViewOnce(t *testing.T) {
 
 // view_once without media is refused before anything touches the client.
 func TestSendViewOnceTextRefused(t *testing.T) {
-	ok, msg, id := sendWhatsAppMessage(nil, nil, "60123456789", "hello", "", "", "", "", nil, "", "", "", false, true, "", true)
+	ok, msg, id := sendWhatsAppMessage(nil, nil, "60123456789", "hello", "", "", "", "", nil, "", "", "", false, true, "", true, time.Time{})
 	if ok || id != "" || !strings.Contains(msg, "view_once") {
 		t.Fatalf("got ok=%v id=%q msg=%q, want a view_once refusal", ok, id, msg)
 	}

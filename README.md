@@ -225,6 +225,9 @@ Claude can access the following tools to interact with WhatsApp:
 **Sending and editing**
 
 - **send_message**: Send a WhatsApp message to a specified phone number or group JID
+  - `schedule_at` (experimental): send it as a native WhatsApp scheduled message, delivered by WhatsApp's server at that time even if the bridge is offline. Text only, 10 minutes to 14 days ahead, at most 30 pending per chat; the phone lists it under Scheduled messages. See [docs/scheduled-messages-re.md](docs/scheduled-messages-re.md)
+- **list_scheduled_messages** (experimental): List scheduled messages still waiting (or posted / cancelled)
+- **cancel_scheduled_message** (experimental): Cancel a scheduled message before its time
 - **edit_message**: Edit the text of a message you sent (WhatsApp allows about 15 minutes, text only)
 - **delete_message**: Delete a message you sent, for everyone in the chat (WhatsApp allows about 2 days; cannot be undone)
 - **send_contact**: Share a contact card (vCard); the recipient gets a Message button that opens a chat with that number

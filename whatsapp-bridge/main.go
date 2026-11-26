@@ -407,6 +407,10 @@ func NewMessageStore() (*MessageStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
+	if err := ensureScheduledTable(db, blobType); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to create scheduled_messages table: %v", err)
+	}
 
 	// Migrate pre-existing stores whose chats table predates unread_count.
 	// CREATE TABLE IF NOT EXISTS above is a no-op on an existing table, so add
@@ -1734,6 +1738,11 @@ type SendMessageRequest struct {
 	// typing) so the operator isn't made to wait again. Automated/API sends leave
 	// it false so they pick up the anti-restriction pacing.
 	NoDelay bool `json:"no_delay,omitempty"`
+	// ScheduleAt (EXPERIMENTAL) sends a text message as a native WhatsApp
+	// scheduled message, revealed by WhatsApp's server at that time: RFC3339,
+	// "YYYY-MM-DD HH:MM" in the bridge's timezone, or unix seconds. 10 minutes
+	// to 14 days ahead; see scheduled.go.
+	ScheduleAt string `json:"schedule_at,omitempty"`
 }
 
 // SendContactRequest shares a contact card. Phones are numbers with country
@@ -1856,7 +1865,7 @@ func holdWithTyping(client *whatsmeow.Client, jid types.JID, d time.Duration) {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, mediaBase64 string, mediaFilename string, mediaMimetype string, mentionedJIDs []string, quotedID string, quotedText string, quotedParticipant string, isForwarded bool, noDelay bool, sendAs string, viewOnce bool) (bool, string, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, mediaBase64 string, mediaFilename string, mediaMimetype string, mentionedJIDs []string, quotedID string, quotedText string, quotedParticipant string, isForwarded bool, noDelay bool, sendAs string, viewOnce bool, scheduleAt time.Time) (bool, string, string) {
 	if viewOnce && mediaPath == "" && mediaBase64 == "" {
 		return false, "view_once needs a photo, video or voice note", ""
 	}
@@ -1884,6 +1893,15 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	// Resolve @lid JIDs to @s.whatsapp.net before sending — normalizeUserJID
 	// is a no-op for already-resolved JIDs, so warm contacts are unaffected.
 	recipientJID = normalizeUserJID(client, recipientJID)
+
+	scheduled := !scheduleAt.IsZero()
+	if scheduled {
+		at, serr := checkScheduledSend(messageStore, recipientJID, scheduleAt, mediaPath != "" || mediaBase64 != "", viewOnce, sendAs)
+		if serr != nil {
+			return false, serr.Error(), ""
+		}
+		scheduleAt = at
+	}
 
 	// Mentions / reply / forward all ride in ContextInfo. Built once and attached
 	// to whichever message variant we send below. Nil when none requested.
@@ -2178,6 +2196,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		msg = wrapped
 		sendExtra = append(sendExtra, whatsmeow.SendRequestExtra{AdditionalNodes: &[]waBinary.Node{viewOnceMetaNode()}})
 		storedContent = viewOnceContent(message)
+	}
+
+	if scheduled {
+		// Nobody sees it now, so no typing delay.
+		return sendScheduledText(client, messageStore, recipient, recipientJID, msg, message, scheduleAt)
 	}
 
 	if !noDelay {
@@ -4014,7 +4037,17 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 			return
 		}
 
-		slog.Info("received request to send message", "message", req.Message, "media_path", req.MediaPath)
+		slog.Info("received request to send message", "message", req.Message, "media_path", req.MediaPath, "schedule_at", req.ScheduleAt)
+
+		var scheduleAt time.Time
+		if req.ScheduleAt != "" {
+			t, err := parseEventTime(req.ScheduleAt)
+			if err != nil {
+				respondError(w, http.StatusBadRequest, fmt.Sprintf("invalid schedule_at: %v", err))
+				return
+			}
+			scheduleAt = t
+		}
 
 		// A reply that names only the quoted ID (the MCP send_message tool) gets
 		// its preview and participant from the store. The manager sends all three.
@@ -4025,7 +4058,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 			}
 		}
 
-		success, message, sentID := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath, req.MediaBase64, req.MediaFilename, req.MediaMimetype, req.MentionedJIDs, req.QuotedID, req.QuotedText, req.QuotedParticipant, req.IsForwarded, req.NoDelay, req.SendAs, req.ViewOnce)
+		success, message, sentID := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath, req.MediaBase64, req.MediaFilename, req.MediaMimetype, req.MentionedJIDs, req.QuotedID, req.QuotedText, req.QuotedParticipant, req.IsForwarded, req.NoDelay, req.SendAs, req.ViewOnce, scheduleAt)
 		var reason string
 		if !success {
 			// Decode known WhatsApp nack codes (463 = reachout time-lock, 479 =
@@ -4116,6 +4149,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 	// Handler for downloading media
 	apiMux.HandleFunc("/send-event", handleSendEvent(client, messageStore))
 	apiMux.HandleFunc("/event-responses", handleEventResponses(messageStore))
+	registerScheduledRoutes(context.Background(), apiMux, client, messageStore)
 
 	apiMux.HandleFunc("/download", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {

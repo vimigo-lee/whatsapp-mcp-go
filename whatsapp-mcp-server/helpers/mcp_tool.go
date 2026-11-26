@@ -109,6 +109,16 @@ func InitMcpTool() {
 		Description: "Send a TEXT message to a person or group on WhatsApp. For groups use the group JID. To reply to (quote) a specific message, pass its ID from list_messages as reply_to_message_id. Text only — to send an image, video, document or any file use send_media instead (and upload_media first if the file is local), and to share a contact card use send_contact, not this tool.",
 	}, sendMessageHandler)
 
+	mcp.AddTool[listScheduledInput, any](server, &mcp.Tool{
+		Name:        "list_scheduled_messages",
+		Description: "List WhatsApp messages scheduled with send_message schedule_at that have not gone out yet (soonest first), with their IDs for cancel_scheduled_message. Pass chat_jid to limit to one chat, status=all to include posted and cancelled ones.",
+	}, listScheduledHandler)
+
+	mcp.AddTool[cancelScheduledInput, any](server, &mcp.Tool{
+		Name:        "cancel_scheduled_message",
+		Description: "Cancel a WhatsApp scheduled message (sent with send_message schedule_at) before its time, so nobody receives it. Pass the chat JID and the message ID returned by send_message or list_scheduled_messages. EXPERIMENTAL.",
+	}, cancelScheduledHandler)
+
 	mcp.AddTool[editMessageInput, any](server, &mcp.Tool{
 		Name:        "edit_message",
 		Description: "Edit the text of a message YOU sent earlier on WhatsApp (WhatsApp only allows this within about 15 minutes of sending, and only for text). Pass the chat JID and the message ID from list_messages or send_message.",
@@ -410,6 +420,7 @@ type sendMessageInput struct {
 	Message          string  `json:"message"`
 	ReplyToMessageID *string `json:"reply_to_message_id,omitempty" jsonschema:"Optional. Message ID to reply to (quote), as shown in list_messages. Must be a message in the same chat as recipient."`
 	NoDelay          *bool   `json:"no_delay,omitempty" jsonschema:"Optional. true sends instantly. Default false: WhatsApp shows typing for a random 3-30 s before the message lands (humanized pacing that protects the number)."`
+	ScheduleAt       *string `json:"schedule_at,omitempty" jsonschema:"Optional, EXPERIMENTAL. Send as a native WhatsApp scheduled message that WhatsApp delivers at this time, even if this server is offline then. RFC3339 with offset (2026-11-28T15:00:00+08:00) or local 2026-11-28 15:00. Rounded down to the minute; must be 10 minutes to 14 days ahead. At most 30 pending per chat. The owner's phone lists it under Scheduled messages."`
 }
 
 type sendContactInput struct {
@@ -560,6 +571,9 @@ func sendMessageHandler(
 	// The bridge fills the quote preview and original sender from its store.
 	if in.ReplyToMessageID != nil && *in.ReplyToMessageID != "" {
 		payload["quoted_id"] = *in.ReplyToMessageID
+	}
+	if in.ScheduleAt != nil && strings.TrimSpace(*in.ScheduleAt) != "" {
+		payload["schedule_at"] = strings.TrimSpace(*in.ScheduleAt)
 	}
 
 	data, err := callAPI(http.MethodPost, "/send", payload)
