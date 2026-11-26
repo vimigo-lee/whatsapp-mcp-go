@@ -109,6 +109,16 @@ func InitMcpTool() {
 		Description: "Send a TEXT message to a person or group on WhatsApp. For groups use the group JID. To reply to (quote) a specific message, pass its ID from list_messages as reply_to_message_id. Text only — to send an image, video, document or any file use send_media instead (and upload_media first if the file is local), and to share a contact card use send_contact, not this tool.",
 	}, sendMessageHandler)
 
+	mcp.AddTool[editMessageInput, any](server, &mcp.Tool{
+		Name:        "edit_message",
+		Description: "Edit the text of a message YOU sent earlier on WhatsApp (WhatsApp only allows this within about 15 minutes of sending, and only for text). Pass the chat JID and the message ID from list_messages or send_message.",
+	}, editMessageHandler)
+
+	mcp.AddTool[deleteMessageInput, any](server, &mcp.Tool{
+		Name:        "delete_message",
+		Description: "Delete a message YOU sent on WhatsApp for everyone in the chat (WhatsApp allows this for about 2 days after sending). Pass the chat JID and the message ID from list_messages or send_message. This cannot be undone.",
+	}, deleteMessageHandler)
+
 	mcp.AddTool[sendContactInput, map[string]any](server, &mcp.Tool{
 		Name:        "send_contact",
 		Description: "Share a contact card (vCard) with a person or group on WhatsApp. The recipient sees the name with a Message button that opens a chat with that number. Use this instead of typing a phone number into send_message when someone asks for a contact.",
@@ -314,6 +324,54 @@ type listChatsInput struct {
 	UnreadOnly         bool    `json:"unread_only,omitempty" jsonschema:"default:false,description:Only return chats that have unread messages"`
 }
 
+type editMessageInput struct {
+	ChatJID   string `json:"chat_jid" jsonschema:"The chat JID the message is in (person like 60123456789@s.whatsapp.net, or group like 123@g.us)"`
+	MessageID string `json:"message_id" jsonschema:"ID of your own sent message to edit"`
+	NewText   string `json:"new_text" jsonschema:"The replacement text"`
+}
+
+type deleteMessageInput struct {
+	ChatJID   string `json:"chat_jid" jsonschema:"The chat JID the message is in (person like 60123456789@s.whatsapp.net, or group like 123@g.us)"`
+	MessageID string `json:"message_id" jsonschema:"ID of your own sent message to delete for everyone"`
+}
+
+// chatJIDOrPhone lets a caller pass a bare phone number where a chat JID is
+// expected; the bridge's /edit and /revoke parse the value as a JID.
+func chatJIDOrPhone(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" || strings.Contains(v, "@") {
+		return v
+	}
+	return strings.TrimPrefix(v, "+") + "@s.whatsapp.net"
+}
+
+func editMessageHandler(ctx context.Context, req *mcp.CallToolRequest, in editMessageInput) (*mcp.CallToolResult, any, error) {
+	if in.ChatJID == "" || in.MessageID == "" || strings.TrimSpace(in.NewText) == "" {
+		return ErrResult("chat_jid, message_id and new_text are required"), nil, nil
+	}
+	if _, err := callAPI(http.MethodPost, "/edit", map[string]any{
+		"recipient":  chatJIDOrPhone(in.ChatJID),
+		"message_id": in.MessageID,
+		"new_text":   in.NewText,
+	}); err != nil {
+		return ErrResult(err.Error()), nil, nil
+	}
+	return OkResult(map[string]any{"success": true}), nil, nil
+}
+
+func deleteMessageHandler(ctx context.Context, req *mcp.CallToolRequest, in deleteMessageInput) (*mcp.CallToolResult, any, error) {
+	if in.ChatJID == "" || in.MessageID == "" {
+		return ErrResult("chat_jid and message_id are required"), nil, nil
+	}
+	if _, err := callAPI(http.MethodPost, "/revoke", map[string]any{
+		"recipient":  chatJIDOrPhone(in.ChatJID),
+		"message_id": in.MessageID,
+	}); err != nil {
+		return ErrResult(err.Error()), nil, nil
+	}
+	return OkResult(map[string]any{"success": true}), nil, nil
+}
+
 type markReadInput struct {
 	ChatJID string `json:"chat_jid" jsonschema:"description:The JID of the chat to mark as read"`
 }
@@ -341,6 +399,7 @@ type sendMessageInput struct {
 	Recipient        string  `json:"recipient" jsonschema:"description:Phone number (no +) or group JID like 123@g.us"`
 	Message          string  `json:"message"`
 	ReplyToMessageID *string `json:"reply_to_message_id,omitempty" jsonschema:"Optional. Message ID to reply to (quote), as shown in list_messages. Must be a message in the same chat as recipient."`
+	NoDelay          *bool   `json:"no_delay,omitempty" jsonschema:"Optional. true sends instantly. Default false: WhatsApp shows typing for a random 3-30 s before the message lands (humanized pacing that protects the number)."`
 }
 
 type sendContactInput struct {
@@ -348,6 +407,7 @@ type sendContactInput struct {
 	Name             string   `json:"name" jsonschema:"Contact name shown on the card"`
 	Phones           []string `json:"phones" jsonschema:"The contact's phone numbers with country code, e.g. [\"60123456789\"]"`
 	ReplyToMessageID *string  `json:"reply_to_message_id,omitempty" jsonschema:"Optional. Message ID to reply to (quote), as shown in list_messages. Must be a message in the same chat as recipient."`
+	NoDelay          *bool    `json:"no_delay,omitempty" jsonschema:"Optional. true sends instantly. Default false: WhatsApp shows typing for a random 3-30 s before the message lands (humanized pacing that protects the number)."`
 }
 
 type sendMediaInput struct {
@@ -358,6 +418,7 @@ type sendMediaInput struct {
 	Filename  *string `json:"filename,omitempty" jsonschema:"description:Filename with extension (e.g. photo.jpg); drives the media type. Optional when url already ends in a filename."`
 	Caption   *string `json:"caption,omitempty" jsonschema:"description:Optional text caption sent with the media"`
 	SendAs    *string `json:"send_as,omitempty" jsonschema:"description:Optional. 'gif' sends an MP4 as a looping muted WhatsApp GIF (WhatsApp GIFs are MP4s — convert .gif files to .mp4 first). 'sticker' sends a WebP (512x512, animated WebP for a moving sticker, max 500 KB, no caption) as a sticker. Omit or 'media' for a normal image/video/document."`
+	NoDelay   *bool   `json:"no_delay,omitempty" jsonschema:"Optional. true sends instantly. Default false: WhatsApp shows typing for a random 3-30 s before the message lands (humanized pacing that protects the number)."`
 }
 
 type sendAudioMessageInput struct {
@@ -480,9 +541,9 @@ func sendMessageHandler(
 	}
 
 	payload := map[string]any{
+		"no_delay":  in.NoDelay != nil && *in.NoDelay,
 		"recipient": in.Recipient,
 		"message":   in.Message,
-		"no_delay":  true,
 	}
 	// The bridge fills the quote preview and original sender from its store.
 	if in.ReplyToMessageID != nil && *in.ReplyToMessageID != "" {
@@ -537,10 +598,10 @@ func sendContactHandler(
 	}
 
 	payload := map[string]any{
+		"no_delay":  in.NoDelay != nil && *in.NoDelay,
 		"recipient": in.Recipient,
 		"name":      in.Name,
 		"phones":    in.Phones,
-		"no_delay":  true,
 	}
 	if in.ReplyToMessageID != nil && *in.ReplyToMessageID != "" {
 		payload["quoted_id"] = *in.ReplyToMessageID
@@ -941,10 +1002,10 @@ func sendMediaHandler(
 			filename = filepath.Base(absPath)
 		}
 		payload := map[string]any{
+			"no_delay":       in.NoDelay != nil && *in.NoDelay,
 			"recipient":      in.Recipient,
 			"media_base64":   base64.StdEncoding.EncodeToString(data),
 			"media_filename": filename,
-			"no_delay":       true,
 		}
 		if mt := mimeForFilename(filename); mt != "" {
 			payload["media_mimetype"] = mt
@@ -1013,10 +1074,10 @@ func sendMediaHandler(
 	}
 
 	payload := map[string]any{
+		"no_delay":       in.NoDelay != nil && *in.NoDelay,
 		"recipient":      in.Recipient,
 		"media_base64":   b64,
 		"media_filename": filename,
-		"no_delay":       true,
 	}
 	// Documents need a real MIME or WhatsApp shows a generic preview and the
 	// file won't open in its native app. The extension wins; a served
