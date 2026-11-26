@@ -285,7 +285,9 @@ func ensureScheduledTable(db *sql.DB, blobType string) error {
 // storedLocal reinterprets a TIMESTAMP read back from the database as the
 // local wall-clock time it was written as (lib/pq labels it UTC).
 func storedLocal(t time.Time) time.Time {
-	if t.IsZero() || t.Location() != time.UTC {
+	// lib/pq returns a zone-less TIMESTAMP in a zero-offset zone that is not
+	// time.UTC itself, so test the offset, not the *Location.
+	if _, off := t.Zone(); t.IsZero() || off != 0 {
 		return t
 	}
 	return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.Local)

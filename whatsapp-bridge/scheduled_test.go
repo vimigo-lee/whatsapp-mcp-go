@@ -402,9 +402,15 @@ func TestStoredLocal(t *testing.T) {
 	prevLocal := time.Local
 	time.Local = time.FixedZone("MYT", 8*3600)
 	defer func() { time.Local = prevLocal }()
-	got := storedLocal(time.Date(2026, 11, 26, 16, 31, 0, 0, time.UTC))
-	if got.Hour() != 16 || got.Location() != time.Local {
-		t.Errorf("got %v", got)
+	// lib/pq's zone for TIMESTAMP is a FixedZone with offset 0, not time.UTC.
+	for _, loc := range []*time.Location{time.UTC, time.FixedZone("", 0)} {
+		got := storedLocal(time.Date(2026, 11, 26, 17, 55, 0, 0, loc))
+		if got.Hour() != 17 || got.Location() != time.Local {
+			t.Errorf("%v: got %v", loc, got)
+		}
+	}
+	if got := storedLocal(time.Date(2026, 11, 26, 17, 55, 0, 0, time.Local)); got.Hour() != 17 {
+		t.Errorf("local time changed to %v", got)
 	}
 }
 
