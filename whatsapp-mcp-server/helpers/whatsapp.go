@@ -161,7 +161,9 @@ func SendFile(recipient, mediaPath string) (bool, string) {
 	return success, msg
 }
 
-func SendAudioVoiceMessage(recipient, mediaPath string) (bool, string) {
+// SendAudioVoiceMessage sends an audio file as a voice note, converting it to
+// Opus .ogg first. viewOnce makes it a play-once voice note.
+func SendAudioVoiceMessage(recipient, mediaPath string, viewOnce bool) (bool, string) {
 	if recipient == "" {
 		return false, "Recipient must be provided"
 	}
@@ -203,9 +205,12 @@ func SendAudioVoiceMessage(recipient, mediaPath string) (bool, string) {
 		return false, "Authentication failed: " + err.Error()
 	}
 
-	payload := map[string]string{
+	payload := map[string]any{
 		"recipient":  recipient,
 		"media_path": finalPath,
+	}
+	if viewOnce {
+		payload["view_once"] = true
 	}
 
 	body, _ := json.Marshal(payload)

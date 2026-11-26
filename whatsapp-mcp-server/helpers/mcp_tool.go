@@ -419,11 +419,13 @@ type sendMediaInput struct {
 	Caption   *string `json:"caption,omitempty" jsonschema:"description:Optional text caption sent with the media"`
 	SendAs    *string `json:"send_as,omitempty" jsonschema:"description:Optional. 'gif' sends an MP4 as a looping muted WhatsApp GIF (WhatsApp GIFs are MP4s — convert .gif files to .mp4 first). 'sticker' sends a WebP (512x512, animated WebP for a moving sticker, max 500 KB, no caption) as a sticker. Omit or 'media' for a normal image/video/document."`
 	NoDelay   *bool   `json:"no_delay,omitempty" jsonschema:"Optional. true sends instantly. Default false: WhatsApp shows typing for a random 3-30 s before the message lands (humanized pacing that protects the number)."`
+	ViewOnce  *bool   `json:"view_once,omitempty" jsonschema:"description:Optional. true sends a photo or video as view-once: the recipient can open it once, then it disappears. Not allowed for documents, GIFs or stickers."`
 }
 
 type sendAudioMessageInput struct {
 	Recipient string `json:"recipient"`
 	MediaPath string `json:"media_path" jsonschema:"description:Absolute path to audio file"`
+	ViewOnce  *bool  `json:"view_once,omitempty" jsonschema:"description:Optional. true sends the voice note as view-once (play once)."`
 }
 
 type downloadMediaInput struct {
@@ -959,6 +961,10 @@ func sendMediaHandler(
 	default:
 		return &mcp.CallToolResult{IsError: true}, map[string]any{"success": false, "error": "send_as must be one of: media, gif, sticker"}, nil
 	}
+	viewOnce := in.ViewOnce != nil && *in.ViewOnce
+	if viewOnce && (sendAs == "gif" || sendAs == "sticker") {
+		return &mcp.CallToolResult{IsError: true}, map[string]any{"success": false, "error": "view_once cannot be combined with send_as=" + sendAs}, nil
+	}
 	hasURL := in.URL != nil && strings.TrimSpace(*in.URL) != ""
 	hasB64 := in.Base64 != nil && strings.TrimSpace(*in.Base64) != ""
 	hasPath := in.MediaPath != nil && strings.TrimSpace(*in.MediaPath) != ""
@@ -1015,6 +1021,9 @@ func sendMediaHandler(
 		}
 		if sendAs != "" && sendAs != "media" {
 			payload["send_as"] = sendAs
+		}
+		if viewOnce {
+			payload["view_once"] = true
 		}
 		if _, err := callAPI(http.MethodPost, "/send", payload); err != nil {
 			return &mcp.CallToolResult{IsError: true}, map[string]any{"success": false, "error": err.Error()}, nil
@@ -1093,6 +1102,9 @@ func sendMediaHandler(
 	if sendAs != "" && sendAs != "media" {
 		payload["send_as"] = sendAs
 	}
+	if viewOnce {
+		payload["view_once"] = true
+	}
 
 	if _, err := callAPI(http.MethodPost, "/send", payload); err != nil {
 		return &mcp.CallToolResult{IsError: true}, map[string]any{"success": false, "error": err.Error()}, nil
@@ -1103,7 +1115,7 @@ func sendMediaHandler(
 // sendMediaDescription tailors send_media's guidance to the deployment: a local
 // install reads files off disk, a remote one cannot and needs an upload first.
 func sendMediaDescription() string {
-	const base = "Send an image, video, document, looping GIF or sticker (see send_as) to a WhatsApp chat, with an optional text caption. Provide the media as EXACTLY ONE of: "
+	const base = "Send an image, video, document, looping GIF or sticker (see send_as) to a WhatsApp chat, with an optional text caption. Set view_once=true to send a photo, video or Opus .ogg voice note as view-once. Provide the media as EXACTLY ONE of: "
 	if callerFilesReadable() {
 		return base + "'media_path' (absolute path to a file on THIS machine — PREFERRED for local files such as spreadsheets, PDFs and photos; the server reads the bytes itself, so never base64 a local file into the tool call), 'url' (a public http(s) link the server downloads), or 'base64' (raw media bytes — last resort). Always pass a 'filename' with its real extension (e.g. report.xlsx) so the document arrives with the right type; media_path derives it automatically."
 	}
@@ -1391,7 +1403,7 @@ func sendAudioMessageHandler(ctx context.Context,
 	req *mcp.CallToolRequest,
 	in sendAudioMessageInput) (*mcp.CallToolResult, map[string]any, error) {
 
-	success, msg := SendAudioVoiceMessage(in.Recipient, in.MediaPath)
+	success, msg := SendAudioVoiceMessage(in.Recipient, in.MediaPath, in.ViewOnce != nil && *in.ViewOnce)
 
 	resultData := map[string]any{"success": success, "message": msg}
 

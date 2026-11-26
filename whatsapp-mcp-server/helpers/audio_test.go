@@ -33,7 +33,7 @@ func TestSendAudioRefusesURLsBeforeFFmpeg(t *testing.T) {
 	short := "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
 	long := "http://10.0.0.1/" + strings.Repeat("a", 5000) + ".mp3"
 	for _, p := range []string{short, long, "concat:/etc/hostname|/etc/hostname", t.TempDir()} {
-		if ok, msg := SendAudioVoiceMessage("60123456789", p); ok {
+		if ok, msg := SendAudioVoiceMessage("60123456789", p, false); ok {
 			t.Errorf("%.60s: accepted (%s)", p, msg)
 		}
 		if _, err := ConvertToOpusOgg(p, "", "32k", 48000); err == nil {
@@ -53,7 +53,7 @@ func TestSendAudioRefusedOverHTTP(t *testing.T) {
 	if err := os.WriteFile(f, []byte("ID3"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if ok, _ := SendAudioVoiceMessage("60123456789", f); ok || len(*calls) != 0 {
+	if ok, _ := SendAudioVoiceMessage("60123456789", f, false); ok || len(*calls) != 0 {
 		t.Errorf("HTTP mode: ok=%v ffmpeg calls=%d, want refused before ffmpeg", ok, len(*calls))
 	}
 }

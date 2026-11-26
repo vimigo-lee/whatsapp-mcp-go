@@ -29,7 +29,7 @@ Start `whatsapp-bridge` -> then run `whatsapp-mcp-server` in your preferred mode
 
 - Go
 - Anthropic Claude Desktop app (or Cursor) or `n8n` workflow
-- FFmpeg (_optional_) - Only needed for audio messages. If you want to send audio files as playable WhatsApp voice messages, they must be in `.ogg` Opus format. With FFmpeg installed, the MCP server will automatically convert non-Opus audio files. Without FFmpeg, you can still send raw audio files using the `send_file` tool.
+- FFmpeg (_optional_) - Only needed for audio messages. If you want to send audio files as playable WhatsApp voice messages, they must be in `.ogg` Opus format. With FFmpeg installed, the MCP server will automatically convert non-Opus audio files. Without FFmpeg, you can still send raw audio files using the `send_media` tool.
 
 ### Steps
 1. **Clone this repository**
@@ -219,8 +219,8 @@ Claude can access the following tools to interact with WhatsApp:
 - **get_last_interaction**: Get the most recent message with a contact
 - **get_message_context**: Retrieve context around a specific message
 - **send_message**: Send a WhatsApp message to a specified phone number or group JID
-- **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
-- **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
+- **send_media**: Send an image, video, document, GIF or sticker to a specified recipient, with an optional caption. `view_once: true` sends a photo or video as view-once
+- **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed). `view_once: true` sends it as a play-once voice note
 - **download_media**: Download media from a WhatsApp message and get the local file path
 - **get_login_status**: Check whether the bridge is connected and logged in to WhatsApp. Returns `{connected, logged_in, pairing_required}`.
 - **get_pairing_qr**: Fetch the WhatsApp pairing QR as a PNG image. Returns image content when pairing is required, or a text message when the bridge is already logged in. Useful for completing the initial device-link flow from inside an MCP-aware UI instead of from the terminal.
@@ -233,11 +233,16 @@ The MCP server supports both sending and receiving various media types:
 
 You can send various media types to your WhatsApp contacts:
 
-- **Images, Videos, Documents**: Use the `send_file` tool to share any supported media type.
+- **Images, Videos, Documents**: Use the `send_media` tool to share any supported media type.
 - **Voice Messages**: Use the `send_audio_message` tool to send audio files as playable WhatsApp voice messages.
   - For optimal compatibility, audio files should be in `.ogg` Opus format.
   - With FFmpeg installed, the system will automatically convert other audio formats (MP3, WAV, etc.) to the required format.
-  - Without FFmpeg, you can still send raw audio files using the `send_file` tool, but they won't appear as playable voice messages.
+  - Without FFmpeg, you can still send raw audio files using the `send_media` tool, but they won't appear as playable voice messages.
+- **View once**: pass `view_once: true` to `send_media` (photos and videos) or `send_audio_message` (voice notes) to send them as view-once; the recipient can open them once. The bridge's `/api/send` takes the same `view_once` field.
+  - Photos and videos are sent wrapped in `ViewOnceMessageV2`, voice notes in `ViewOnceMessageV2Extension`, each with the media's own `viewOnce` flag set and a `<meta view_once="true"/>` stanza child, which is how WhatsApp's clients send them.
+  - Documents, stickers, GIFs (`send_as: gif` or a `.gif` file) and text are refused.
+  - The sent message is stored with a `[view once]` prefix (before any caption), so `list_messages` shows it as view-once.
+  - Incoming view-once messages cannot be read by the bridge: WhatsApp does not give linked devices the keys for them, so they never reach the store.
 
 #### Media Downloading
 

@@ -56,6 +56,7 @@ import (
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/proto/waCommon"
+	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/proto/waMmsRetry"
@@ -1684,6 +1685,9 @@ type SendMessageRequest struct {
 	// looping, muted WhatsApp GIF (GifPlayback); "sticker" sends a WebP (static
 	// or animated) as a sticker. Empty or "media" keeps the normal send.
 	SendAs string `json:"send_as,omitempty"`
+	// ViewOnce sends a photo, video or voice note as view-once (the recipient
+	// can open it once). Rejected for documents, stickers, GIFs and text.
+	ViewOnce bool `json:"view_once,omitempty"`
 	// NoDelay skips the humanized pre-send typing delay for this message. Set by
 	// interactive callers (the admin composer, where a human already spent time
 	// typing) so the operator isn't made to wait again. Automated/API sends leave
@@ -1811,7 +1815,10 @@ func holdWithTyping(client *whatsmeow.Client, jid types.JID, d time.Duration) {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, mediaBase64 string, mediaFilename string, mediaMimetype string, mentionedJIDs []string, quotedID string, quotedText string, quotedParticipant string, isForwarded bool, noDelay bool, sendAs string) (bool, string, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, mediaBase64 string, mediaFilename string, mediaMimetype string, mentionedJIDs []string, quotedID string, quotedText string, quotedParticipant string, isForwarded bool, noDelay bool, sendAs string, viewOnce bool) (bool, string, string) {
+	if viewOnce && mediaPath == "" && mediaBase64 == "" {
+		return false, "view_once needs a photo, video or voice note", ""
+	}
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp", ""
 	}
@@ -1957,6 +1964,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		}
 		if errMsg := checkSendAs(sendAs, mediaType, mimeType, mediaData, message); errMsg != "" {
 			return false, errMsg, ""
+		}
+		if viewOnce {
+			if errMsg := checkViewOnce(sendAs, mediaType, mimeType); errMsg != "" {
+				return false, errMsg, ""
+			}
 		}
 
 		resp, err := client.Upload(context.Background(), mediaData, mediaType)
@@ -2112,11 +2124,26 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	// before sending, so automated traffic does not fire as an instant burst on a
 	// fixed cadence (the fingerprint that gets numbers restricted). Skipped for
 	// interactive sends (noDelay) and when the delay band is disabled.
+	// View-once: wrap the finished media message (context info included) the
+	// way WhatsApp's clients do and add the <meta view_once="true"/> stanza
+	// child, which whatsmeow does not derive from the protobuf.
+	var sendExtra []whatsmeow.SendRequestExtra
+	storedContent := message
+	if viewOnce {
+		wrapped := wrapViewOnce(msg)
+		if wrapped == nil {
+			return false, "view_once works only for photos, videos and voice notes", ""
+		}
+		msg = wrapped
+		sendExtra = append(sendExtra, whatsmeow.SendRequestExtra{AdditionalNodes: &[]waBinary.Node{viewOnceMetaNode()}})
+		storedContent = viewOnceContent(message)
+	}
+
 	if !noDelay {
 		holdWithTyping(client, recipientJID, humanSendDelay())
 	}
 
-	sendResp, err := client.SendMessage(context.Background(), recipientJID, msg)
+	sendResp, err := client.SendMessage(context.Background(), recipientJID, msg, sendExtra...)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err), ""
@@ -2142,7 +2169,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 			slog.Warn("failed to store chat for sent message", "error", storeErr)
 		}
 		if storeErr := messageStore.StoreMessage(
-			sendResp.ID, chatJID, sender, message, sentAt, true,
+			sendResp.ID, chatJID, sender, storedContent, sentAt, true,
 			stMediaType, stFilename, stURL, stDirectPath, stMediaKey, stFileSHA, stFileEncSHA, stFileLen,
 			quotedID, quotedParticipant, quotedText, isForwarded,
 		); storeErr != nil {
@@ -3951,7 +3978,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 			}
 		}
 
-		success, message, sentID := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath, req.MediaBase64, req.MediaFilename, req.MediaMimetype, req.MentionedJIDs, req.QuotedID, req.QuotedText, req.QuotedParticipant, req.IsForwarded, req.NoDelay, req.SendAs)
+		success, message, sentID := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath, req.MediaBase64, req.MediaFilename, req.MediaMimetype, req.MentionedJIDs, req.QuotedID, req.QuotedText, req.QuotedParticipant, req.IsForwarded, req.NoDelay, req.SendAs, req.ViewOnce)
 		var reason string
 		if !success {
 			// Decode known WhatsApp nack codes (463 = reachout time-lock, 479 =
