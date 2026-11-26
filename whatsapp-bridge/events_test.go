@@ -258,3 +258,11 @@ func TestBuildEventMessageCarriesSecret(t *testing.T) {
 		t.Fatalf("meta node = %+v", meta)
 	}
 }
+
+func TestEventInviteContent(t *testing.T) {
+	inv := &waE2E.EventInviteMessage{EventTitle: proto.String("Test 2"), StartTime: proto.Int64(1795681800)}
+	got := describeMessage(&waE2E.Message{EventInviteMessage: inv})
+	if !strings.HasPrefix(got, "[event] Test 2\nWhen: ") {
+		t.Errorf("content = %q", got)
+	}
+}

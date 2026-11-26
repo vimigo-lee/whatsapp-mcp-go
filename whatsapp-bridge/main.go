@@ -369,6 +369,19 @@ func NewMessageStore() (*MessageStore, error) {
 			PRIMARY KEY (msg_id, sender)
 		);
 
+		-- Each event's last known details (base64 EventMessage protobuf), so an
+		-- edit or cancellation from this line can resend the whole event (see
+		-- event_edit.go).
+		CREATE TABLE IF NOT EXISTS event_messages (
+			msg_id TEXT PRIMARY KEY,
+			chat_jid TEXT,
+			data TEXT NOT NULL,
+			-- invite: sent from a phone as an EventInviteMessage (cover picture,
+			-- hosted event) rather than a plain EventMessage.
+			invite BOOLEAN NOT NULL DEFAULT FALSE,
+			cover TEXT
+		);
+
 		-- WhatsApp Business chat labels (app-state LabelEdit / LabelAssociationChat).
 		-- Read-only mirror for the manager UI; applied on the phone, synced here.
 		CREATE TABLE IF NOT EXISTS wa_labels (
@@ -416,6 +429,15 @@ func NewMessageStore() (*MessageStore, error) {
 		_, _ = db.Exec(`ALTER TABLE chats ADD COLUMN IF NOT EXISTS unread_count INTEGER NOT NULL DEFAULT 0`)
 	} else {
 		_, _ = db.Exec(`ALTER TABLE chats ADD COLUMN unread_count INTEGER NOT NULL DEFAULT 0`)
+	}
+
+	// event_messages gained invite/cover after it first shipped in test builds.
+	if isPostgres {
+		_, _ = db.Exec(`ALTER TABLE event_messages ADD COLUMN IF NOT EXISTS invite BOOLEAN NOT NULL DEFAULT FALSE`)
+		_, _ = db.Exec(`ALTER TABLE event_messages ADD COLUMN IF NOT EXISTS cover TEXT`)
+	} else {
+		_, _ = db.Exec(`ALTER TABLE event_messages ADD COLUMN invite BOOLEAN NOT NULL DEFAULT FALSE`)
+		_, _ = db.Exec(`ALTER TABLE event_messages ADD COLUMN cover TEXT`)
 	}
 
 	// Soft-delete (revoke) and edit-timestamp columns so revokes/edits leave a
@@ -842,6 +864,7 @@ func moveLIDChatRows(tx *sql.Tx, isPostgresDB bool, lidJID, pnJID string) error 
 			with(lidJID, pnJID, nil)},
 		{`UPDATE reactions SET chat_jid = ? WHERE chat_jid = ?`, []any{pnJID, lidJID}},
 		{`UPDATE event_responses SET chat_jid = ? WHERE chat_jid = ?`, []any{pnJID, lidJID}},
+		{`UPDATE event_messages SET chat_jid = ? WHERE chat_jid = ?`, []any{pnJID, lidJID}},
 		{`UPDATE wa_chat_labels SET chat_jid = ? WHERE chat_jid = ? AND label_id NOT IN (SELECT label_id FROM wa_chat_labels WHERE chat_jid = ?)`,
 			[]any{pnJID, lidJID, pnJID}},
 		{`DELETE FROM wa_chat_labels WHERE chat_jid = ?`, []any{lidJID}},
@@ -2449,6 +2472,8 @@ func describeMessage(m *waE2E.Message) string {
 		return "[poll vote]"
 	case m.GetEventMessage() != nil:
 		return eventContent(m)
+	case m.GetEventInviteMessage() != nil:
+		return eventInviteContent(m.GetEventInviteMessage())
 	}
 	return ""
 }
@@ -2979,6 +3004,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		msg.Message = decrypted
 	}
 
+	// Keep each event's details for edits/cancellations sent from this line.
+	noteEventMessage(messageStore, msg, chatJID)
+
 	// An RSVP to an event is stored against the event, like a reaction, and
 	// never becomes a message of its own.
 	if handleEventResponse(client, messageStore, msg, chatJID, sender, logger) {
@@ -3070,6 +3098,12 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 	if content == "" {
 		content = captionOf(msg.Message)
+	}
+
+	// View-once media is marked the way our own view-once sends are, so
+	// readers (the MCP, the manager) show a placeholder instead of the media.
+	if mediaType != "" && isViewOnceEvent(msg) {
+		content = viewOnceContent(content)
 	}
 
 	if content == "" && mediaType == "" {
@@ -4116,6 +4150,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 	// Handler for downloading media
 	apiMux.HandleFunc("/send-event", handleSendEvent(client, messageStore))
 	apiMux.HandleFunc("/event-responses", handleEventResponses(messageStore))
+	apiMux.HandleFunc("/edit-event", handleEditEvent(client, messageStore, false))
+	apiMux.HandleFunc("/cancel-event", handleEditEvent(client, messageStore, true))
+	apiMux.HandleFunc("/respond-event", handleRespondEvent(client, messageStore))
 
 	apiMux.HandleFunc("/download", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -7532,6 +7569,9 @@ func main() {
 
 		case *events.HistorySync:
 			handleHistorySync(client, messageStore, v, logger)
+
+		case *events.UndecryptableMessage:
+			handleUnavailableViewOnce(client, messageStore, v, logger)
 
 		case *events.Contact:
 			if u := v.Action.GetUsername(); u != "" {

@@ -60,6 +60,7 @@ func checkLIDMerge(t *testing.T, driver, dsn string, pg bool) {
 		`CREATE TABLE wa_chat_labels (chat_jid TEXT NOT NULL, label_id TEXT NOT NULL, PRIMARY KEY (chat_jid, label_id))`,
 		`CREATE TABLE event_responses (chat_jid TEXT, msg_id TEXT, sender TEXT, response TEXT, extra_guests INTEGER NOT NULL DEFAULT 0,
 			timestamp TIMESTAMP, PRIMARY KEY (msg_id, sender))`,
+		`CREATE TABLE event_messages (msg_id TEXT PRIMARY KEY, chat_jid TEXT, data TEXT NOT NULL)`,
 	} {
 		if _, err := db.Exec(q); err != nil {
 			t.Fatalf("%s: %v", q, err)

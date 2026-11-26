@@ -134,6 +134,21 @@ func InitMcpTool() {
 		Description: "List who answered a WhatsApp event (going, maybe, not going, and extra guests), with counts. Pass the event's message ID from list_messages or send_event.",
 	}, getEventResponsesHandler)
 
+	mcp.AddTool[editEventInput, map[string]any](server, &mcp.Tool{
+		Name:        "edit_event",
+		Description: editEventDescription,
+	}, editEventHandler)
+
+	mcp.AddTool[cancelEventInput, map[string]any](server, &mcp.Tool{
+		Name:        "cancel_event",
+		Description: "Cancel a WhatsApp event this number sent. The card stays in the chat marked as cancelled, and people can no longer RSVP.",
+	}, cancelEventHandler)
+
+	mcp.AddTool[respondEventInput, map[string]any](server, &mcp.Tool{
+		Name:        "respond_event",
+		Description: "Answer a WhatsApp event from this number: going, maybe or not_going (optionally with extra guests when going). The organizer and everyone in the chat see the answer, as if given on the phone. A later answer replaces an earlier one.",
+	}, respondEventHandler)
+
 	mcp.AddTool[sendMediaInput, map[string]any](server, &mcp.Tool{
 		Name:        "send_media",
 		Description: sendMediaDescription(),
