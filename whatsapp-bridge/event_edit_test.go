@@ -124,6 +124,12 @@ func TestEventEditRoundTrip(t *testing.T) {
 	if err != nil || saved.GetName() != "Launch party" {
 		t.Errorf("edited event not remembered: %+v %v", saved, err)
 	}
+
+	// The edit also shows in the chat, like WhatsApp's "… updated Launch party".
+	var notice string
+	if err := ms.db.QueryRow(`SELECT content FROM messages WHERE id = 'EDIT1'`).Scan(&notice); err != nil || notice != "[event updated] Launch party" {
+		t.Errorf("edit notice = %q (%v), want [event updated] Launch party", notice, err)
+	}
 }
 
 func TestEventEditNeedsKnownEvent(t *testing.T) {
@@ -186,5 +192,11 @@ func TestReceivedInviteKeepsCover(t *testing.T) {
 	}
 	if invite, _ := ms.EventInviteInfo("nope"); invite {
 		t.Error("unknown event reported as invite")
+	}
+}
+
+func TestEventNoticeContent(t *testing.T) {
+	if got := eventNoticeContent(&waE2E.EventMessage{Name: proto.String("Dinner"), IsCanceled: proto.Bool(true)}); got != "[event cancellation] Dinner" {
+		t.Errorf("cancel notice = %q", got)
 	}
 }

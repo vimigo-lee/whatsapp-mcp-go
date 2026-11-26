@@ -3114,6 +3114,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 						logger.Warnf("Failed to apply message edit: %v", err)
 					} else if !changed {
 						logger.Infof("Ignored edit of %s in %s from %s: not the author", target, chatJID, msg.Info.Sender)
+					} else if ev := unwrapMessage(pm.GetEditedMessage()).GetEventMessage(); ev != nil {
+						// WhatsApp shows an event edit in the chat ("Lee updated …").
+						storeEventNotice(client, messageStore, chatJID, msg.Info.ID, sender, msg.Info.IsFromMe, msg.Info.Timestamp, ev)
 					}
 				}
 			}
