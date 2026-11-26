@@ -31,6 +31,7 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // SendEventRequest is the body of POST /api/send-event.
@@ -386,6 +387,11 @@ func sendEventMessage(client *whatsmeow.Client, messageStore *MessageStore, req 
 	presence.active(client)
 
 	// WhatsApp never echoes our own send, so store it here.
+	if messageStore != nil {
+		if err := messageStore.SaveEventMessage(recipientJID.String(), sendResp.ID, msg.GetEventMessage()); err != nil {
+			slog.Warn("failed to save sent event details", "error", err)
+		}
+	}
 	if messageStore != nil && client.Store.ID != nil {
 		sender := client.Store.ID.ToNonAD().String()
 		chatJID := recipientJID.String()
@@ -486,11 +492,76 @@ func handleEventResponses(messageStore *MessageStore) http.HandlerFunc {
 				guests += x.ExtraGuests
 			}
 		}
-		respondJSON(w, http.StatusOK, map[string]any{
+		out := map[string]any{
 			"message_id":         id,
 			"responses":          rs,
 			"counts":             counts,
 			"extra_guests_going": guests,
-		})
+		}
+		// A phone-sent invite: flag it and pass its cover picture along, so a
+		// reader can draw the card the way WhatsApp does.
+		if invite, cover := messageStore.EventInviteInfo(id); invite {
+			out["invite"] = true
+			if cover != "" {
+				out["cover"] = "data:image/jpeg;base64," + cover
+			}
+		}
+		respondJSON(w, http.StatusOK, out)
 	}
+}
+
+// eventInviteContent renders an EventInviteMessage, the form phones now use to
+// send an event (title, times, place, call link, caption), as the same
+// "[event] …" card text an EventMessage gets.
+func eventInviteContent(inv *waE2E.EventInviteMessage) string {
+	if inv == nil {
+		return ""
+	}
+	return eventContent(&waE2E.Message{EventMessage: inviteToEventMessage(inv)})
+}
+
+// inviteToEventMessage reads an EventInviteMessage as an EventMessage. Fields
+// other than the title and start are read through reflection: older whatsmeow
+// protobufs lack them.
+func inviteToEventMessage(inv *waE2E.EventInviteMessage) *waE2E.EventMessage {
+	m := inv.ProtoReflect()
+	str := func(name string) string {
+		if f := m.Descriptor().Fields().ByName(protoreflect.Name(name)); f != nil && m.Has(f) {
+			return strings.TrimSpace(m.Get(f).String())
+		}
+		return ""
+	}
+	num := func(name string) int64 {
+		if f := m.Descriptor().Fields().ByName(protoreflect.Name(name)); f != nil && m.Has(f) {
+			if f.Kind() == protoreflect.EnumKind {
+				return int64(m.Get(f).Enum())
+			}
+			if f.Kind() == protoreflect.BoolKind {
+				if m.Get(f).Bool() {
+					return 1
+				}
+				return 0
+			}
+			return m.Get(f).Int()
+		}
+		return 0
+	}
+	ev := &waE2E.EventMessage{
+		Name:       proto.String(inv.GetEventTitle()),
+		StartTime:  proto.Int64(inv.GetStartTime()),
+		IsCanceled: proto.Bool(num("isCanceled") == 1 || num("status") == 2), // status 2 = CANCELED
+	}
+	if d := str("caption"); d != "" {
+		ev.Description = proto.String(d)
+	}
+	if et := num("endTime"); et > 0 {
+		ev.EndTime = proto.Int64(et)
+	}
+	if l := str("locationName"); l != "" {
+		ev.Location = &waE2E.LocationMessage{Name: proto.String(l)}
+	}
+	if c := str("callLink"); c != "" {
+		ev.JoinLink = proto.String(c)
+	}
+	return ev
 }

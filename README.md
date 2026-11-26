@@ -232,6 +232,9 @@ Claude can access the following tools to interact with WhatsApp:
 - **delete_message**: Delete a message you sent, for everyone in the chat (WhatsApp allows about 2 days; cannot be undone)
 - **send_contact**: Share a contact card (vCard); the recipient gets a Message button that opens a chat with that number
 - **send_event**: Send an event invitation (name, start/end time, place, call link) that people answer with Going / Maybe / Not going. Needs a whatsmeow whose `getTypeFromMessage` returns `"event"` for `EventMessage` (the vimigo builds patch this in); stock whatsmeow sends it as `"text"` and WhatsApp rejects it with error 479
+- **edit_event**: Change an event this number sent (name, times, place, call link, description); only the fields passed change. Sent as WhatsApp's encrypted event edit, which needs the same whatsmeow `"event"` stanza patch, extended to event-edit `SecretEncryptedMessage`s
+- **cancel_event**: Cancel an event this number sent; the card stays in the chat marked cancelled
+- **respond_event**: Answer an event from this number (going / maybe / not going, extra guests); sent as WhatsApp's encrypted RSVP, which needs the same `"event"` stanza patch
 - **get_event_responses**: List the RSVPs to an event with counts and extra guests; `list_messages` also shows them under the event
 
 **Media**

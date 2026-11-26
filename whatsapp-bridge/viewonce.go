@@ -6,6 +6,8 @@ import (
 	"go.mau.fi/whatsmeow"
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/types/events"
+	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -69,4 +71,36 @@ func viewOnceContent(caption string) string {
 		return "[view once]"
 	}
 	return "[view once] " + caption
+}
+
+// isViewOnceEvent reports whether a received (or phone-sent) message is
+// view-once: wrapped in a ViewOnce message, or media flagged view_once.
+func isViewOnceEvent(evt *events.Message) bool {
+	if evt == nil {
+		return false
+	}
+	if evt.IsViewOnce || evt.IsViewOnceV2 || evt.IsViewOnceV2Extension {
+		return true
+	}
+	m := unwrapMessage(evt.Message)
+	return m.GetImageMessage().GetViewOnce() || m.GetVideoMessage().GetViewOnce() || m.GetAudioMessage().GetViewOnce()
+}
+
+// handleUnavailableViewOnce records a view-once message that arrived on this
+// linked device without its content. WhatsApp only lets the phone open view-once
+// media, so a companion gets an <unavailable type="view_once"/> stub and the
+// phone never resends it. Storing a "[view once]" placeholder (through the
+// normal message path, webhook included) lets the MCP and the manager show that
+// one arrived, like WhatsApp Web's "you can only open it on your phone".
+// It reports whether v was such a stub.
+func handleUnavailableViewOnce(client *whatsmeow.Client, messageStore *MessageStore, v *events.UndecryptableMessage, logger waLog.Logger) bool {
+	if v == nil || !v.IsUnavailable || v.UnavailableType != events.UnavailableTypeViewOnce {
+		return false
+	}
+	handleMessage(client, messageStore, &events.Message{
+		Info:       v.Info,
+		Message:    &waE2E.Message{Conversation: proto.String(viewOnceContent(""))},
+		IsViewOnce: true,
+	}, logger)
+	return true
 }

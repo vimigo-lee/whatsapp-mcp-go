@@ -7,6 +7,10 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	wastore "go.mau.fi/whatsmeow/store"
+	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
+	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -135,5 +139,52 @@ func TestViewOnceMetaAndStoredContent(t *testing.T) {
 	}
 	if got := viewOnceContent("look"); got != "[view once] look" {
 		t.Errorf("caption: %q", got)
+	}
+}
+
+func TestReceivedViewOnceIsMarked(t *testing.T) {
+	img := &waE2E.Message{ImageMessage: &waE2E.ImageMessage{Caption: proto.String("hi"), ViewOnce: proto.Bool(true)}}
+	if !isViewOnceEvent(&events.Message{Message: img}) {
+		t.Error("image flagged view_once not detected")
+	}
+	if !isViewOnceEvent(&events.Message{IsViewOnceV2: true, Message: &waE2E.Message{VideoMessage: &waE2E.VideoMessage{}}}) {
+		t.Error("ViewOnceV2 wrapper not detected")
+	}
+	if isViewOnceEvent(&events.Message{Message: &waE2E.Message{ImageMessage: &waE2E.ImageMessage{}}}) {
+		t.Error("plain image detected as view-once")
+	}
+}
+
+func TestUnavailableViewOnceIsStoredAsPlaceholder(t *testing.T) {
+	t.Chdir(t.TempDir())
+	prevPG := isPostgres
+	isPostgres = false
+	defer func() { isPostgres = prevPG }()
+	ms, err := NewMessageStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ms.Close() })
+
+	own := types.NewJID("60100000000", types.DefaultUserServer)
+	friend := types.NewJID("60111111111", types.DefaultUserServer)
+	client := &whatsmeow.Client{Store: &wastore.Device{ID: &own}}
+	info := types.MessageInfo{MessageSource: types.MessageSource{Chat: friend, Sender: friend}, ID: "VO1", Timestamp: time.Now()}
+	if err := ms.StoreChat(friend.String(), "Friend", time.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	if handleUnavailableViewOnce(client, ms, &events.UndecryptableMessage{Info: info, IsUnavailable: true, UnavailableType: events.UnavailableTypeUnknown}, waLog.Noop) {
+		t.Error("an unavailable message of another type must be ignored")
+	}
+	if !handleUnavailableViewOnce(client, ms, &events.UndecryptableMessage{Info: info, IsUnavailable: true, UnavailableType: events.UnavailableTypeViewOnce}, waLog.Noop) {
+		t.Fatal("view-once stub not handled")
+	}
+	var content string
+	if err := ms.db.QueryRow(`SELECT content FROM messages WHERE id = 'VO1'`).Scan(&content); err != nil {
+		t.Fatal(err)
+	}
+	if content != "[view once]" {
+		t.Errorf("content = %q, want [view once]", content)
 	}
 }
