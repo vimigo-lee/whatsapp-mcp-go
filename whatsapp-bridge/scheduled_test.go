@@ -419,11 +419,21 @@ func TestScheduledNoticeFormat(t *testing.T) {
 	time.Local = time.FixedZone("MYT", 8*3600)
 	defer func() { time.Local = prevLocal }()
 	at := time.Date(2026, 11, 28, 7, 0, 0, 0, time.UTC)
-	if got := scheduledNotice(scheduledMarker, at); got != "[scheduled message]\nScheduled for: 2026-11-28T15:00:00+08:00" {
+	if got := scheduledNotice(scheduledMarker, at, ""); got != "[scheduled message]\nScheduled for: 2026-11-28T15:00:00+08:00" {
 		t.Errorf("notice = %q", got)
 	}
-	if got := scheduledNotice(scheduledMarker, time.Time{}); got != "[scheduled message]" {
+	if got := scheduledNotice(scheduledMarker, time.Time{}, ""); got != "[scheduled message]" {
 		t.Errorf("timeless notice = %q", got)
+	}
+	full := scheduledNotice(scheduledMarker, at, "See you\n\nat 3")
+	if full != "[scheduled message]\nScheduled for: 2026-11-28T15:00:00+08:00\n\nSee you\n\nat 3" {
+		t.Errorf("notice with text = %q", full)
+	}
+	if gotAt, gotText := parseScheduledNotice(full); !gotAt.Equal(at) || gotText != "See you\n\nat 3" {
+		t.Errorf("parse = %v %q", gotAt, gotText)
+	}
+	if gotAt, gotText := parseScheduledNotice("[scheduled message]\n\nhi"); !gotAt.IsZero() || gotText != "hi" {
+		t.Errorf("parse timeless = %v %q", gotAt, gotText)
 	}
 	for c, want := range map[string]bool{
 		"[scheduled message]":                         true,
@@ -449,7 +459,7 @@ func TestScheduledNoticeLifecycle(t *testing.T) {
 		if err := store.SaveScheduledMessage(ScheduledMessage{ID: id, ChatJID: chat, Content: "text " + id, ScheduledAt: at, KeyID: "k" + id}, "me"); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.StoreMessage(id, chat, "me", scheduledNotice(scheduledMarker, at), sentAt, true,
+		if err := store.StoreMessage(id, chat, "me", scheduledNotice(scheduledMarker, at, "text "+id), sentAt, true,
 			"", "", "", "", nil, nil, nil, 0, "", "", "", false); err != nil {
 			t.Fatal(err)
 		}
@@ -470,7 +480,7 @@ func TestScheduledNoticeLifecycle(t *testing.T) {
 	if c, ts := read("A"); c != "text A" || !ts.Equal(at) {
 		t.Errorf("A = %q at %v, want the text at %v", c, ts, at)
 	}
-	if c, ts := read("B"); c != scheduledNotice(scheduledCancelledMarker, at) || !ts.Equal(sentAt) {
+	if c, ts := read("B"); c != scheduledNotice(scheduledCancelledMarker, at, "text B") || !ts.Equal(sentAt) {
 		t.Errorf("B = %q at %v", c, ts)
 	}
 	// Cancelling again, or a non-notice row, changes nothing.

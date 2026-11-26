@@ -597,7 +597,7 @@ func sendScheduledText(client *whatsmeow.Client, store *MessageStore, recipient 
 			slog.Warn("failed to store scheduled message", "id", id, "error", err)
 		}
 		// The chat's "You scheduled a message" notice; it becomes the message at its time.
-		if err := store.StoreMessage(id, chatJID, sender, scheduledNotice(scheduledMarker, at), time.Now(), true,
+		if err := store.StoreMessage(id, chatJID, sender, scheduledNotice(scheduledMarker, at, content), time.Now(), true,
 			"", "", "", "", nil, nil, nil, 0, "", "", "", false); err != nil {
 			slog.Warn("failed to store scheduled notice", "id", id, "error", err)
 		}
@@ -614,14 +614,18 @@ func sendScheduledText(client *whatsmeow.Client, store *MessageStore, recipient 
 //	[scheduled message]
 //	Scheduled for: 2026-11-28T15:00:00+08:00
 //
-// stamped when it was scheduled. At its time the row becomes the message
+//	See you at 3
+//
+// stamped when it was scheduled. The text after the blank line is the
+// message, for a chat list's "Scheduled: See you at 3" preview. At its time the row becomes the message
 // itself (its text, stamped at the scheduled time); a cancel turns it into
 //
 //	[scheduled message cancelled]
 //	Scheduled for: 2026-11-28T15:00:00+08:00
 //
-// The "Scheduled for" line is left out when the time is unknown (a message
-// scheduled on the owner's phone: whatsmeow does not expose the stanza's st).
+// The "Scheduled for" line is left out when the time is unknown, and the text
+// when it is (both, for a message scheduled on the owner's phone: whatsmeow
+// does not expose the stanza's st, and the bridge has no key to read it).
 // Only the sender's devices get a notice; WhatsApp shows recipients nothing
 // until the reveal.
 
@@ -630,12 +634,30 @@ const (
 	scheduledCancelledMarker = "[scheduled message cancelled]"
 )
 
-// scheduledNotice is a notice row's content; at may be zero.
-func scheduledNotice(marker string, at time.Time) string {
-	if at.IsZero() {
-		return marker
+// scheduledNotice is a notice row's content; at and text may be empty.
+func scheduledNotice(marker string, at time.Time, text string) string {
+	out := marker
+	if !at.IsZero() {
+		out += "\nScheduled for: " + at.In(time.Local).Format(time.RFC3339)
 	}
-	return marker + "\nScheduled for: " + at.In(time.Local).Format(time.RFC3339)
+	if text != "" {
+		out += "\n\n" + text
+	}
+	return out
+}
+
+// parseScheduledNotice splits a notice row's content into its time and text
+// (either may be empty).
+func parseScheduledNotice(content string) (at time.Time, text string) {
+	head, body, _ := strings.Cut(content, "\n\n")
+	for _, line := range strings.Split(head, "\n") {
+		if v, ok := strings.CutPrefix(line, "Scheduled for: "); ok {
+			if t, err := time.Parse(time.RFC3339, v); err == nil {
+				at = t
+			}
+		}
+	}
+	return at, body
 }
 
 // isScheduledNotice reports whether content is a scheduled-message notice
@@ -659,14 +681,11 @@ func (store *MessageStore) markScheduledCancelled(chatJID, id string, at time.Ti
 	if !isScheduledNotice(content) {
 		return
 	}
+	storedAt, text := parseScheduledNotice(content)
 	if at.IsZero() {
-		if i := strings.Index(content, "\nScheduled for: "); i >= 0 {
-			if t, err := time.Parse(time.RFC3339, content[i+len("\nScheduled for: "):]); err == nil {
-				at = t
-			}
-		}
+		at = storedAt
 	}
-	if err := store.setNoticeContent(chatJID, id, scheduledNotice(scheduledCancelledMarker, at)); err != nil {
+	if err := store.setNoticeContent(chatJID, id, scheduledNotice(scheduledCancelledMarker, at, text)); err != nil {
 		slog.Warn("could not mark scheduled notice cancelled", "id", id, "error", err)
 	}
 }
