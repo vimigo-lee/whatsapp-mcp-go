@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"go.mau.fi/whatsmeow"
 	waBinary "go.mau.fi/whatsmeow/binary"
@@ -320,6 +321,7 @@ func editEvent(client *whatsmeow.Client, messageStore *MessageStore, req EditEve
 	if err := messageStore.UpdateMessageContent(chat.String(), req.MessageID, eventContent(&waE2E.Message{EventMessage: ev})+" (edited)"); err != nil {
 		slog.Warn("failed to update edited event in store", "error", err)
 	}
+	storeEventNotice(client, messageStore, chat.String(), resp.ID, client.Store.ID.User, true, time.Now(), ev)
 	return resp.ID, nil
 }
 
@@ -376,5 +378,45 @@ func handleEditEvent(client *whatsmeow.Client, messageStore *MessageStore, cance
 			return
 		}
 		respondJSON(w, http.StatusOK, map[string]any{"success": true, "message_id": req.MessageID, "edit_id": id, "cancelled": cancel})
+	}
+}
+
+// eventNoticeContent is the chat notice WhatsApp shows when an event changes:
+// "[event updated] Name", or "[event cancellation] Name" when it was cancelled.
+func eventNoticeContent(ev *waE2E.EventMessage) string {
+	name := strings.TrimSpace(ev.GetName())
+	if name == "" {
+		name = "(untitled)"
+	}
+	if ev.GetIsCanceled() {
+		return "[event cancellation] " + name
+	}
+	return "[event updated] " + name
+}
+
+// storeEventNotice records an event edit or cancellation as its own message
+// (the edit's message ID), so readers show "You updated …" / "Lee updated …"
+// in the chat the way WhatsApp does.
+func storeEventNotice(_ *whatsmeow.Client, messageStore *MessageStore, chatJID, editID, sender string, fromMe bool, ts time.Time, ev *waE2E.EventMessage) {
+	if messageStore == nil || editID == "" || ev == nil {
+		return
+	}
+	if err := messageStore.StoreMessage(editID, chatJID, sender, eventNoticeContent(ev), ts, fromMe,
+		"", "", "", "", nil, nil, nil, 0, "", "", "", false); err != nil {
+		slog.Warn("failed to store event notice", "id", editID, "error", err)
+		return
+	}
+	// Bump the chat like any message, keeping its stored name (StoreChat
+	// overwrites the name). The event's chat is always already stored.
+	q := "SELECT name FROM chats WHERE jid = ?"
+	if isPostgres {
+		q = "SELECT name FROM chats WHERE jid = $1"
+	}
+	var name sql.NullString
+	if err := messageStore.db.QueryRow(q, chatJID).Scan(&name); err != nil {
+		return
+	}
+	if err := messageStore.StoreChat(chatJID, name.String, ts); err != nil {
+		slog.Warn("failed to bump chat for event notice", "chat", chatJID, "error", err)
 	}
 }
