@@ -124,6 +124,16 @@ func InitMcpTool() {
 		Description: "Share a contact card (vCard) with a person or group on WhatsApp. The recipient sees the name with a Message button that opens a chat with that number. Use this instead of typing a phone number into send_message when someone asks for a contact.",
 	}, sendContactHandler)
 
+	mcp.AddTool[sendEventInput, map[string]any](server, &mcp.Tool{
+		Name:        "send_event",
+		Description: sendEventDescription,
+	}, sendEventHandler)
+
+	mcp.AddTool[getEventResponsesInput, any](server, &mcp.Tool{
+		Name:        "get_event_responses",
+		Description: "List who answered a WhatsApp event (going, maybe, not going, and extra guests), with counts. Pass the event's message ID from list_messages or send_event.",
+	}, getEventResponsesHandler)
+
 	mcp.AddTool[sendMediaInput, map[string]any](server, &mcp.Tool{
 		Name:        "send_media",
 		Description: sendMediaDescription(),

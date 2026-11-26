@@ -210,20 +210,52 @@ This application consists of two main components:
 
 Claude can access the following tools to interact with WhatsApp:
 
+**Reading**
+
 - **search_contacts**: Search for contacts by name or phone number
 - **list_messages**: Retrieve messages with optional filters and context
+- **get_message_context**: Retrieve context around a specific message
 - **list_chats**: List available chats with metadata
 - **get_chat**: Get information about a specific chat
 - **get_direct_chat_by_contact**: Find a direct chat with a specific contact
 - **get_contact_chats**: List all chats involving a specific contact
 - **get_last_interaction**: Get the most recent message with a contact
-- **get_message_context**: Retrieve context around a specific message
+- **mark_read**: Mark a chat as read, clearing its unread badge on the phone too
+
+**Sending and editing**
+
 - **send_message**: Send a WhatsApp message to a specified phone number or group JID
+- **edit_message**: Edit the text of a message you sent (WhatsApp allows about 15 minutes, text only)
+- **delete_message**: Delete a message you sent, for everyone in the chat (WhatsApp allows about 2 days; cannot be undone)
+- **send_contact**: Share a contact card (vCard); the recipient gets a Message button that opens a chat with that number
+- **send_event**: Send an event invitation (name, start/end time, place, call link) that people answer with Going / Maybe / Not going. Needs a whatsmeow whose `getTypeFromMessage` returns `"event"` for `EventMessage` (the vimigo builds patch this in); stock whatsmeow sends it as `"text"` and WhatsApp rejects it with error 479
+- **get_event_responses**: List the RSVPs to an event with counts and extra guests; `list_messages` also shows them under the event
+
+**Media**
+
 - **send_media**: Send an image, video, document, GIF or sticker to a specified recipient, with an optional caption. `view_once: true` sends a photo or video as view-once
+- **upload_media**: Upload a file to temporary storage and get a short-lived URL for `send_media` (for remote servers that cannot read the caller's disk; local files go straight to `send_media`)
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed). `view_once: true` sends it as a play-once voice note
 - **download_media**: Download media from a WhatsApp message and get the local file path
+
+**Account**
+
 - **get_login_status**: Check whether the bridge is connected and logged in to WhatsApp. Returns `{connected, logged_in, pairing_required}`.
 - **get_pairing_qr**: Fetch the WhatsApp pairing QR as a PNG image. Returns image content when pairing is required, or a text message when the bridge is already logged in. Useful for completing the initial device-link flow from inside an MCP-aware UI instead of from the terminal.
+
+**Groups**
+
+- **create_group**: Create a group with a name and initial participants; this number becomes the owner
+- **list_groups**: List every group this number is in, with JID, name and participants
+- **add_group_participants**: Add participants to a group; reports per person, with `needs_invite` when their privacy settings block direct adds
+- **share_group_history**: Share a group's recent text messages (last 14 days, at most 100) with members who were just added, like WhatsApp's "send recent messages" (admin; bridge built with `-tags grouphistory`)
+- **remove_group_participants**: Remove participants from a group (admin)
+- **promote_group_admins**: Make participants admins (admin)
+- **demote_group_admins**: Demote admins back to regular members (admin)
+- **set_group_name**: Change a group's name, max 25 characters (admin if the group is locked)
+- **set_group_topic**: Change a group's topic/description (admin if the group is locked)
+- **get_group_invite_link**: Get a group's invite link; `reset=true` revokes it and makes a new one (admin)
+- **leave_group**: Leave a group
 
 ### Media Handling Features
 

@@ -357,6 +357,18 @@ func NewMessageStore() (*MessageStore, error) {
 			PRIMARY KEY (msg_id, sender)
 		);
 
+		-- RSVPs to WhatsApp events (see events.go): one answer per person per
+		-- event, the latest replacing earlier ones. msg_id is the event's ID.
+		CREATE TABLE IF NOT EXISTS event_responses (
+			chat_jid TEXT,
+			msg_id TEXT,
+			sender TEXT,
+			response TEXT,
+			extra_guests INTEGER NOT NULL DEFAULT 0,
+			timestamp TIMESTAMP,
+			PRIMARY KEY (msg_id, sender)
+		);
+
 		-- WhatsApp Business chat labels (app-state LabelEdit / LabelAssociationChat).
 		-- Read-only mirror for the manager UI; applied on the phone, synced here.
 		CREATE TABLE IF NOT EXISTS wa_labels (
@@ -743,6 +755,34 @@ func normalizeUserJID(client *whatsmeow.Client, jid types.JID) types.JID {
 	return pn
 }
 
+// groupInfoParticipant renders one member for /group-info. In LID-addressed
+// groups WhatsApp often leaves PhoneNumber empty, so the number comes from our
+// own LID mapping store instead; it stays "" only when that is unknown too.
+func groupInfoParticipant(client *whatsmeow.Client, pp types.GroupParticipant) map[string]interface{} {
+	phone := pp.PhoneNumber.User
+	if phone == "" {
+		for _, j := range []types.JID{pp.LID, pp.JID} {
+			if j.Server != types.HiddenUserServer {
+				continue
+			}
+			if pn := normalizeUserJID(client, j); pn.Server == types.DefaultUserServer {
+				phone = pn.User
+				break
+			}
+		}
+	}
+	if phone == "" && pp.JID.Server == types.DefaultUserServer {
+		phone = pp.JID.User
+	}
+	return map[string]interface{}{
+		"jid":          pp.JID.String(),
+		"phone_number": phone,
+		"lid":          pp.LID.String(),
+		"is_admin":     pp.IsAdmin || pp.IsSuperAdmin,
+		"display_name": pp.DisplayName,
+	}
+}
+
 // moveLIDChatRows moves everything stored under a contact's @lid chat to their
 // phone-number chat, inside the caller's transaction.
 //
@@ -801,6 +841,7 @@ func moveLIDChatRows(tx *sql.Tx, isPostgresDB bool, lidJID, pnJID string) error 
 				SELECT 1 FROM messages p WHERE p.chat_jid = ? AND p.id = messages.id AND ` + same("messages", "p") + `)`,
 			with(lidJID, pnJID, nil)},
 		{`UPDATE reactions SET chat_jid = ? WHERE chat_jid = ?`, []any{pnJID, lidJID}},
+		{`UPDATE event_responses SET chat_jid = ? WHERE chat_jid = ?`, []any{pnJID, lidJID}},
 		{`UPDATE wa_chat_labels SET chat_jid = ? WHERE chat_jid = ? AND label_id NOT IN (SELECT label_id FROM wa_chat_labels WHERE chat_jid = ?)`,
 			[]any{pnJID, lidJID, pnJID}},
 		{`DELETE FROM wa_chat_labels WHERE chat_jid = ?`, []any{lidJID}},
@@ -2406,6 +2447,8 @@ func describeMessage(m *waE2E.Message) string {
 		return "[poll]"
 	case m.GetPollUpdateMessage() != nil:
 		return "[poll vote]"
+	case m.GetEventMessage() != nil:
+		return eventContent(m)
 	}
 	return ""
 }
@@ -2936,6 +2979,12 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		msg.Message = decrypted
 	}
 
+	// An RSVP to an event is stored against the event, like a reaction, and
+	// never becomes a message of its own.
+	if handleEventResponse(client, messageStore, msg, chatJID, sender, logger) {
+		return
+	}
+
 	// Reactions carry no text/media, so the empty-content guard below would drop
 	// them. Persist them against their target message instead so the MCP's
 	// /messages output can surface them (empty text = the sender cleared theirs).
@@ -2997,6 +3046,10 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 				edited := extractTextContent(pm.GetEditedMessage())
 				if edited == "" {
 					edited = captionOf(pm.GetEditedMessage())
+				}
+				if edited == "" {
+					// An edited or cancelled event.
+					edited = eventContent(unwrapMessage(pm.GetEditedMessage()))
 				}
 				if edited != "" {
 					changed, err := messageStore.UpdateOwnMessageContent(chatJID, target, msg.Info.IsFromMe, senders, edited+" (edited)")
@@ -3753,13 +3806,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 		}
 		participants := make([]map[string]interface{}, 0, len(info.Participants))
 		for _, pp := range info.Participants {
-			participants = append(participants, map[string]interface{}{
-				"jid":          pp.JID.String(),
-				"phone_number": pp.PhoneNumber.User,
-				"lid":          pp.LID.String(),
-				"is_admin":     pp.IsAdmin || pp.IsSuperAdmin,
-				"display_name": pp.DisplayName,
-			})
+			participants = append(participants, groupInfoParticipant(client, pp))
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{"participants": participants})
@@ -4067,6 +4114,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 	})
 
 	// Handler for downloading media
+	apiMux.HandleFunc("/send-event", handleSendEvent(client, messageStore))
+	apiMux.HandleFunc("/event-responses", handleEventResponses(messageStore))
+
 	apiMux.HandleFunc("/download", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -6255,6 +6305,13 @@ func (store *MessageStore) FormatMessage(msg MessageInteraction, showChatInfo bo
 	// the message text (which may itself be long or contain brackets/pipes).
 	if rx := store.GetReactions(msg.ID); len(rx) > 0 {
 		sb.WriteString("    ⤷ reactions: " + oneLine(strings.Join(rx, ", ")) + "\n")
+	}
+
+	// RSVPs to an event, grouped by answer.
+	if strings.HasPrefix(msg.Content, "[event") {
+		if rsvp := formatEventResponses(store.GetEventResponses(msg.ID)); rsvp != "" {
+			sb.WriteString("    ⤷ RSVPs: " + oneLine(rsvp) + "\n")
+		}
 	}
 
 	return sb.String()
