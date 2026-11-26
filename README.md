@@ -220,6 +220,8 @@ Claude can access the following tools to interact with WhatsApp:
 - **get_message_context**: Retrieve context around a specific message
 - **send_message**: Send a WhatsApp message to a specified phone number or group JID
 - **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
+- **send_event**: Send an event invitation (name, start/end time, place, call link) that people answer with Going / Maybe / Not going. Needs a whatsmeow whose `getTypeFromMessage` returns `"event"` for `EventMessage` (the vimigo builds patch this in); stock whatsmeow sends it as `"text"` and WhatsApp rejects it with error 479
+- **get_event_responses**: List the RSVPs to an event with counts and extra guests; `list_messages` also shows them under the event
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
 - **download_media**: Download media from a WhatsApp message and get the local file path
 - **get_login_status**: Check whether the bridge is connected and logged in to WhatsApp. Returns `{connected, logged_in, pairing_required}`.

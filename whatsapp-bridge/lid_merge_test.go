@@ -53,11 +53,13 @@ func checkLIDMerge(t *testing.T, driver, dsn string, pg bool) {
 		return out
 	}
 	for _, q := range []string{
-		`DROP TABLE IF EXISTS messages`, `DROP TABLE IF EXISTS reactions`, `DROP TABLE IF EXISTS wa_chat_labels`,
+		`DROP TABLE IF EXISTS messages`, `DROP TABLE IF EXISTS reactions`, `DROP TABLE IF EXISTS wa_chat_labels`, `DROP TABLE IF EXISTS event_responses`,
 		`CREATE TABLE messages (id TEXT, chat_jid TEXT, sender TEXT, content TEXT, timestamp TIMESTAMP, is_from_me BOOLEAN NOT NULL DEFAULT FALSE,
 			deleted_at TIMESTAMP, edited_at TIMESTAMP, PRIMARY KEY (id, chat_jid))`,
 		`CREATE TABLE reactions (msg_id TEXT, sender TEXT, chat_jid TEXT, emoji TEXT, PRIMARY KEY (msg_id, sender))`,
 		`CREATE TABLE wa_chat_labels (chat_jid TEXT NOT NULL, label_id TEXT NOT NULL, PRIMARY KEY (chat_jid, label_id))`,
+		`CREATE TABLE event_responses (chat_jid TEXT, msg_id TEXT, sender TEXT, response TEXT, extra_guests INTEGER NOT NULL DEFAULT 0,
+			timestamp TIMESTAMP, PRIMARY KEY (msg_id, sender))`,
 	} {
 		if _, err := db.Exec(q); err != nil {
 			t.Fatalf("%s: %v", q, err)
@@ -84,6 +86,7 @@ func checkLIDMerge(t *testing.T, driver, dsn string, pg bool) {
 	for _, q := range []string{
 		`INSERT INTO reactions VALUES ('BOTH', '601', '` + lid + `', '👍')`,
 		`INSERT INTO wa_chat_labels VALUES ('` + lid + `', 'L1')`,
+		`INSERT INTO event_responses (chat_jid, msg_id, sender, response) VALUES ('` + lid + `', 'BOTH', '601', 'going')`,
 		`INSERT INTO wa_chat_labels VALUES ('` + lid + `', 'L2')`,
 		`INSERT INTO wa_chat_labels VALUES ('` + pn + `', 'L2')`,
 	} {
@@ -111,6 +114,9 @@ func checkLIDMerge(t *testing.T, driver, dsn string, pg bool) {
 			t.Fatal(err)
 		}
 		return n
+	}
+	if n := count(`SELECT COUNT(*) FROM event_responses WHERE chat_jid = ?`, pn); n != 1 {
+		t.Error("the RSVP did not follow its chat to the phone JID")
 	}
 	if n := count(`SELECT COUNT(*) FROM messages WHERE chat_jid = ?`, lid); n != 0 {
 		t.Errorf("%d messages left under the @lid chat", n)
