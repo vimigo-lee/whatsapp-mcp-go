@@ -352,3 +352,56 @@ func TestEffectiveScheduledStatus(t *testing.T) {
 		t.Errorf("future pending = %s", s)
 	}
 }
+
+func TestParseChatJID(t *testing.T) {
+	for in, want := range map[string]string{
+		"60165420926":                "60165420926@s.whatsapp.net",
+		"+60165420926":               "60165420926@s.whatsapp.net",
+		"60165420926@s.whatsapp.net": "60165420926@s.whatsapp.net",
+		"1203@g.us":                  "1203@g.us",
+	} {
+		got, err := parseChatJID(in)
+		if err != nil || got.String() != want {
+			t.Errorf("%q -> %v, %v", in, got, err)
+		}
+	}
+	if _, err := parseChatJID("not a number"); err == nil {
+		t.Error("accepted garbage")
+	}
+}
+
+// A time given in another offset is stored and read back as the same
+// instant, and reads come back in time.Local.
+func TestScheduledTimesAreLocalWallClock(t *testing.T) {
+	prevLocal := time.Local
+	time.Local = time.FixedZone("MYT", 8*3600)
+	defer func() { time.Local = prevLocal }()
+	store := newScheduledTestStore(t)
+	at := time.Date(2026, 11, 28, 7, 0, 0, 0, time.UTC) // 15:00 MYT
+	if err := store.SaveScheduledMessage(ScheduledMessage{ID: "Z", ChatJID: "60222@s.whatsapp.net", Content: "x", ScheduledAt: at, KeyID: "k"}, "me"); err != nil {
+		t.Fatal(err)
+	}
+	m, err := store.GetScheduledMessage("60222@s.whatsapp.net", "Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m.ScheduledAt.Equal(at) {
+		t.Errorf("read back %v, want instant %v", m.ScheduledAt, at)
+	}
+	if n, _ := store.PostDueScheduled(at.Add(-time.Second)); n != 0 {
+		t.Error("posted a second early")
+	}
+	if n, _ := store.PostDueScheduled(at); n != 1 {
+		t.Error("not posted at its time")
+	}
+}
+
+func TestStoredLocal(t *testing.T) {
+	prevLocal := time.Local
+	time.Local = time.FixedZone("MYT", 8*3600)
+	defer func() { time.Local = prevLocal }()
+	got := storedLocal(time.Date(2026, 11, 26, 16, 31, 0, 0, time.UTC))
+	if got.Hour() != 16 || got.Location() != time.Local {
+		t.Errorf("got %v", got)
+	}
+}

@@ -278,12 +278,24 @@ func ensureScheduledTable(db *sql.DB, blobType string) error {
 	return err
 }
 
+// The bridge binds times as time.Local wall clock (Postgres TIMESTAMP drops
+// the offset; see ListMessages), and storedLocal reads them back the same way.
+
+// storedLocal reinterprets a TIMESTAMP read back from the database as the
+// local wall-clock time it was written as (lib/pq labels it UTC).
+func storedLocal(t time.Time) time.Time {
+	if t.IsZero() || t.Location() != time.UTC {
+		return t
+	}
+	return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.Local)
+}
+
 func (store *MessageStore) SaveScheduledMessage(m ScheduledMessage, sender string) error {
-	now := time.Now()
+	now := time.Now().In(time.Local)
 	_, err := store.db.Exec(pgPlaceholders(`INSERT INTO scheduled_messages
 		(id, chat_jid, content, sender, reveal_key_id, reveal_key, scheduled_at, status, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
-		m.ID, m.ChatJID, m.Content, sender, m.KeyID, m.RevealKey, m.ScheduledAt, scheduledStatusPending, now, now)
+		m.ID, m.ChatJID, m.Content, sender, m.KeyID, m.RevealKey, m.ScheduledAt.In(time.Local), scheduledStatusPending, now, now)
 	return err
 }
 
@@ -301,6 +313,7 @@ func (store *MessageStore) GetScheduledMessage(chatJID, id string) (ScheduledMes
 	err := store.db.QueryRow(pgPlaceholders(`SELECT id, chat_jid, content, reveal_key_id, reveal_key, scheduled_at, status, created_at
 		FROM scheduled_messages WHERE chat_jid = ? AND id = ?`), chatJID, id).
 		Scan(&m.ID, &m.ChatJID, &m.Content, &m.KeyID, &m.RevealKey, &m.ScheduledAt, &m.Status, &m.CreatedAt)
+	m.ScheduledAt, m.CreatedAt = storedLocal(m.ScheduledAt), storedLocal(m.CreatedAt)
 	return m, err
 }
 
@@ -328,6 +341,7 @@ func (store *MessageStore) ListScheduledMessages(chatJID, status string) ([]Sche
 		if err := rows.Scan(&m.ID, &m.ChatJID, &m.Content, &m.ScheduledAt, &m.Status, &m.CreatedAt); err != nil {
 			return nil, err
 		}
+		m.ScheduledAt, m.CreatedAt = storedLocal(m.ScheduledAt), storedLocal(m.CreatedAt)
 		out = append(out, m)
 	}
 	return out, rows.Err()
@@ -337,7 +351,7 @@ func (store *MessageStore) ListScheduledMessages(chatJID, status string) ([]Sche
 // whether the row was in from.
 func (store *MessageStore) SetScheduledStatus(chatJID, id, from, to string) (bool, error) {
 	return store.execChanged(pgPlaceholders(`UPDATE scheduled_messages SET status = ?, updated_at = ?
-		WHERE chat_jid = ? AND id = ? AND status = ?`), to, time.Now(), chatJID, id, from)
+		WHERE chat_jid = ? AND id = ? AND status = ?`), to, time.Now().In(time.Local), chatJID, id, from)
 }
 
 // PostDueScheduled moves messages whose time came into the message history,
@@ -346,7 +360,7 @@ func (store *MessageStore) SetScheduledStatus(chatJID, id, from, to string) (boo
 // list_messages. It returns how many it moved.
 func (store *MessageStore) PostDueScheduled(now time.Time) (int, error) {
 	rows, err := store.db.Query(pgPlaceholders(`SELECT id, chat_jid, content, sender, scheduled_at FROM scheduled_messages
-		WHERE status = ? AND scheduled_at <= ?`), scheduledStatusPending, now)
+		WHERE status = ? AND scheduled_at <= ?`), scheduledStatusPending, now.In(time.Local))
 	if err != nil {
 		return 0, err
 	}
@@ -361,6 +375,7 @@ func (store *MessageStore) PostDueScheduled(now time.Time) (int, error) {
 			rows.Close()
 			return 0, err
 		}
+		d.at = storedLocal(d.at)
 		list = append(list, d)
 	}
 	rows.Close()
@@ -459,7 +474,7 @@ func registerScheduledRoutes(ctx context.Context, apiMux *http.ServeMux, client 
 		}
 		chat := strings.TrimSpace(r.URL.Query().Get("chat_jid"))
 		if chat != "" {
-			jid, err := types.ParseJID(chat)
+			jid, err := parseChatJID(chat)
 			if err != nil {
 				respondError(w, http.StatusBadRequest, fmt.Sprintf("invalid chat_jid: %v", err))
 				return
@@ -494,7 +509,7 @@ func registerScheduledRoutes(ctx context.Context, apiMux *http.ServeMux, client 
 			respondError(w, http.StatusBadRequest, "recipient and message_id are required")
 			return
 		}
-		chat, err := types.ParseJID(req.Recipient)
+		chat, err := parseChatJID(req.Recipient)
 		if err != nil {
 			respondError(w, http.StatusBadRequest, fmt.Sprintf("invalid recipient: %v", err))
 			return
@@ -533,6 +548,19 @@ func registerScheduledRoutes(ctx context.Context, apiMux *http.ServeMux, client 
 		slog.Info("scheduled message cancelled", "id", row.ID, "chat", chat.String())
 		respondJSON(w, http.StatusOK, map[string]any{"success": true})
 	})
+}
+
+// parseChatJID takes a JID or, like /send, a bare phone number.
+func parseChatJID(s string) (types.JID, error) {
+	s = strings.TrimSpace(s)
+	if !strings.Contains(s, "@") {
+		s = strings.TrimPrefix(s, "+")
+		if s == "" || strings.Trim(s, "0123456789") != "" {
+			return types.JID{}, fmt.Errorf("%q is neither a JID nor a phone number", s)
+		}
+		return types.NewJID(s, types.DefaultUserServer), nil
+	}
+	return types.ParseJID(s)
 }
 
 // effectiveScheduledStatus is a row's status, saying "posted" for a pending
