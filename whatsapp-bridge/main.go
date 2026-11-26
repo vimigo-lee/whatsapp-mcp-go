@@ -742,6 +742,34 @@ func normalizeUserJID(client *whatsmeow.Client, jid types.JID) types.JID {
 	return pn
 }
 
+// groupInfoParticipant renders one member for /group-info. In LID-addressed
+// groups WhatsApp often leaves PhoneNumber empty, so the number comes from our
+// own LID mapping store instead; it stays "" only when that is unknown too.
+func groupInfoParticipant(client *whatsmeow.Client, pp types.GroupParticipant) map[string]interface{} {
+	phone := pp.PhoneNumber.User
+	if phone == "" {
+		for _, j := range []types.JID{pp.LID, pp.JID} {
+			if j.Server != types.HiddenUserServer {
+				continue
+			}
+			if pn := normalizeUserJID(client, j); pn.Server == types.DefaultUserServer {
+				phone = pn.User
+				break
+			}
+		}
+	}
+	if phone == "" && pp.JID.Server == types.DefaultUserServer {
+		phone = pp.JID.User
+	}
+	return map[string]interface{}{
+		"jid":          pp.JID.String(),
+		"phone_number": phone,
+		"lid":          pp.LID.String(),
+		"is_admin":     pp.IsAdmin || pp.IsSuperAdmin,
+		"display_name": pp.DisplayName,
+	}
+}
+
 // moveLIDChatRows moves everything stored under a contact's @lid chat to their
 // phone-number chat, inside the caller's transaction.
 //
@@ -3726,13 +3754,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 		}
 		participants := make([]map[string]interface{}, 0, len(info.Participants))
 		for _, pp := range info.Participants {
-			participants = append(participants, map[string]interface{}{
-				"jid":          pp.JID.String(),
-				"phone_number": pp.PhoneNumber.User,
-				"lid":          pp.LID.String(),
-				"is_admin":     pp.IsAdmin || pp.IsSuperAdmin,
-				"display_name": pp.DisplayName,
-			})
+			participants = append(participants, groupInfoParticipant(client, pp))
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{"participants": participants})
