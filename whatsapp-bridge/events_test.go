@@ -266,3 +266,18 @@ func TestEventInviteContent(t *testing.T) {
 		t.Errorf("content = %q", got)
 	}
 }
+
+// RSVP times are read back as the local time they were stored as, whatever
+// zone the driver labels them with (lib/pq: a zero-offset zone), so an answer
+// given at 16:08 in UTC+8 does not show as 00:08 the next day.
+func TestEventResponseTimesStayLocal(t *testing.T) {
+	prevLocal, prevDisplay := time.Local, displayLoc
+	time.Local = time.FixedZone("MYT", 8*3600)
+	displayLoc = time.Local
+	defer func() { time.Local, displayLoc = prevLocal, prevDisplay }()
+
+	got := storedLocal(time.Date(2026, 11, 26, 16, 8, 0, 0, time.FixedZone("", 0))).In(displayLoc)
+	if got.Hour() != 16 || got.Day() != 26 {
+		t.Errorf("RSVP time read back as %v, want 16:08 on the 26th", got)
+	}
+}

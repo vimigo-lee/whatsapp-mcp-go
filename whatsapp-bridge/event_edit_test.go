@@ -200,3 +200,19 @@ func TestEventNoticeContent(t *testing.T) {
 		t.Errorf("cancel notice = %q", got)
 	}
 }
+
+// An event notice row names the event it is about in quoted_message_id, so a
+// chat view can open that event's details from the notice.
+func TestEventNoticeNamesItsEvent(t *testing.T) {
+	store := newScheduledTestStore(t)
+	chat := "60222@s.whatsapp.net"
+	ev := &waE2E.EventMessage{Name: proto.String("Dinner")}
+	storeEventNotice(nil, store, chat, "EDIT1", "EVENT1", "60111", true, time.Date(2026, 11, 26, 16, 0, 0, 0, time.Local), ev)
+	var content, quoted string
+	if err := store.db.QueryRow(`SELECT content, quoted_message_id FROM messages WHERE id = 'EDIT1'`).Scan(&content, &quoted); err != nil {
+		t.Fatal(err)
+	}
+	if content != "[event updated] Dinner" || quoted != "EVENT1" {
+		t.Errorf("notice = %q quoting %q", content, quoted)
+	}
+}

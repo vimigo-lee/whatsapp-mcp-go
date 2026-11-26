@@ -321,7 +321,7 @@ func editEvent(client *whatsmeow.Client, messageStore *MessageStore, req EditEve
 	if err := messageStore.UpdateMessageContent(chat.String(), req.MessageID, eventContent(&waE2E.Message{EventMessage: ev})+" (edited)"); err != nil {
 		slog.Warn("failed to update edited event in store", "error", err)
 	}
-	storeEventNotice(client, messageStore, chat.String(), resp.ID, client.Store.ID.User, true, time.Now(), ev)
+	storeEventNotice(client, messageStore, chat.String(), resp.ID, req.MessageID, client.Store.ID.User, true, time.Now(), ev)
 	return resp.ID, nil
 }
 
@@ -397,12 +397,14 @@ func eventNoticeContent(ev *waE2E.EventMessage) string {
 // storeEventNotice records an event edit or cancellation as its own message
 // (the edit's message ID), so readers show "You updated …" / "Lee updated …"
 // in the chat the way WhatsApp does.
-func storeEventNotice(_ *whatsmeow.Client, messageStore *MessageStore, chatJID, editID, sender string, fromMe bool, ts time.Time, ev *waE2E.EventMessage) {
+// eventID, the edited event's message ID, goes in the row's quoted_message_id,
+// so a chat view can open that event's details from the notice.
+func storeEventNotice(_ *whatsmeow.Client, messageStore *MessageStore, chatJID, editID, eventID, sender string, fromMe bool, ts time.Time, ev *waE2E.EventMessage) {
 	if messageStore == nil || editID == "" || ev == nil {
 		return
 	}
 	if err := messageStore.StoreMessage(editID, chatJID, sender, eventNoticeContent(ev), ts, fromMe,
-		"", "", "", "", nil, nil, nil, 0, "", "", "", false); err != nil {
+		"", "", "", "", nil, nil, nil, 0, eventID, "", "", false); err != nil {
 		slog.Warn("failed to store event notice", "id", editID, "error", err)
 		return
 	}

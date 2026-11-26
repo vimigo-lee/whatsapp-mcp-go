@@ -234,6 +234,9 @@ func handleEventResponse(client *whatsmeow.Client, messageStore *MessageStore, m
 // StoreEventResponse upserts a person's RSVP. A later answer replaces an
 // earlier one, the way the phone shows only someone's latest choice.
 func (store *MessageStore) StoreEventResponse(chatJID, eventID, sender, response string, extraGuests int, ts time.Time) error {
+	// Bind local wall clock, as the rest of the store does (Postgres TIMESTAMP
+	// drops the offset); getStoredEventResponses reads it back with storedLocal.
+	ts = ts.In(time.Local)
 	if isPostgres {
 		_, err := store.db.Exec(
 			`INSERT INTO event_responses (chat_jid, msg_id, sender, response, extra_guests, timestamp)
@@ -298,7 +301,8 @@ func (store *MessageStore) eventCreator(eventID string) (creator string, at time
 	if creator = bareUser(sender); creator == "" {
 		return "", time.Time{}, false
 	}
-	return creator, at, true
+	// Stored as local wall clock; lib/pq hands it back labelled UTC.
+	return creator, storedLocal(at), true
 }
 
 // bareUser reduces "60123:5@s.whatsapp.net" or "60123" to "60123", the form
@@ -330,7 +334,9 @@ func (store *MessageStore) getStoredEventResponses(eventID string) []EventRespon
 			continue
 		}
 		r.Name = store.GetSenderName(r.Sender)
-		r.Timestamp = r.Timestamp.In(displayLoc)
+		// Stored as local wall clock; lib/pq hands it back labelled UTC, so
+		// read it as local before converting (it showed 8 h late in UTC+8).
+		r.Timestamp = storedLocal(r.Timestamp).In(displayLoc)
 		out = append(out, r)
 	}
 	return out
