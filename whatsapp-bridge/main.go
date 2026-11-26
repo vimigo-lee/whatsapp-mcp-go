@@ -3036,6 +3036,12 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		return
 	}
 
+	// Scheduled messages (scheduled.go): a notice row for our own, and a
+	// cancel turns it into a cancelled one; others' wait for their reveal.
+	if handleScheduledIncoming(messageStore, msg, chatJID, sender) {
+		return
+	}
+
 	// Reactions carry no text/media, so the empty-content guard below would drop
 	// them. Persist them against their target message instead so the MCP's
 	// /messages output can surface them (empty text = the sender cleared theirs).

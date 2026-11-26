@@ -9,8 +9,10 @@ import (
 	"time"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
+	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -403,5 +405,111 @@ func TestStoredLocal(t *testing.T) {
 	got := storedLocal(time.Date(2026, 11, 26, 16, 31, 0, 0, time.UTC))
 	if got.Hour() != 16 || got.Location() != time.Local {
 		t.Errorf("got %v", got)
+	}
+}
+
+func TestScheduledNoticeFormat(t *testing.T) {
+	prevLocal := time.Local
+	time.Local = time.FixedZone("MYT", 8*3600)
+	defer func() { time.Local = prevLocal }()
+	at := time.Date(2026, 11, 28, 7, 0, 0, 0, time.UTC)
+	if got := scheduledNotice(scheduledMarker, at); got != "[scheduled message]\nScheduled for: 2026-11-28T15:00:00+08:00" {
+		t.Errorf("notice = %q", got)
+	}
+	if got := scheduledNotice(scheduledMarker, time.Time{}); got != "[scheduled message]" {
+		t.Errorf("timeless notice = %q", got)
+	}
+	for c, want := range map[string]bool{
+		"[scheduled message]":                         true,
+		"[scheduled message]\nScheduled for: x":       true,
+		"[scheduled message cancelled]":               false,
+		"[scheduled message] is what I typed, really": false,
+		"hello": false,
+	} {
+		if isScheduledNotice(c) != want {
+			t.Errorf("isScheduledNotice(%q) = %v", c, !want)
+		}
+	}
+}
+
+// The notice row stored at send time becomes the message at its time, and a
+// cancelled one keeps its time in the cancelled notice.
+func TestScheduledNoticeLifecycle(t *testing.T) {
+	store := newScheduledTestStore(t)
+	chat := "60222@s.whatsapp.net"
+	at := time.Date(2026, 11, 26, 16, 31, 0, 0, time.Local)
+	sentAt := at.Add(-13 * time.Minute)
+	for _, id := range []string{"A", "B"} {
+		if err := store.SaveScheduledMessage(ScheduledMessage{ID: id, ChatJID: chat, Content: "text " + id, ScheduledAt: at, KeyID: "k" + id}, "me"); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.StoreMessage(id, chat, "me", scheduledNotice(scheduledMarker, at), sentAt, true,
+			"", "", "", "", nil, nil, nil, 0, "", "", "", false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store.SetScheduledStatus(chat, "B", scheduledStatusPending, scheduledStatusCancelled)
+	store.markScheduledCancelled(chat, "B", at)
+	if n, _ := store.PostDueScheduled(at); n != 1 {
+		t.Fatalf("posted %d", n)
+	}
+	read := func(id string) (string, time.Time) {
+		var c string
+		var ts time.Time
+		if err := store.db.QueryRow(`SELECT content, timestamp FROM messages WHERE id = ?`, id).Scan(&c, &ts); err != nil {
+			t.Fatal(err)
+		}
+		return c, ts
+	}
+	if c, ts := read("A"); c != "text A" || !ts.Equal(at) {
+		t.Errorf("A = %q at %v, want the text at %v", c, ts, at)
+	}
+	if c, ts := read("B"); c != scheduledNotice(scheduledCancelledMarker, at) || !ts.Equal(sentAt) {
+		t.Errorf("B = %q at %v", c, ts)
+	}
+	// Cancelling again, or a non-notice row, changes nothing.
+	store.markScheduledCancelled(chat, "A", at)
+	if c, _ := read("A"); c != "text A" {
+		t.Errorf("A rewritten to %q", c)
+	}
+}
+
+func TestHandleScheduledIncoming(t *testing.T) {
+	store := newScheduledTestStore(t)
+	chat := "60222@s.whatsapp.net"
+	cr := &waE2E.Message{ConditionalRevealMessage: &waE2E.ConditionalRevealMessage{RevealKeyID: proto.String("k")}}
+	evt := func(id string, fromMe bool, m *waE2E.Message) *events.Message {
+		e := &events.Message{Message: m}
+		e.Info.ID, e.Info.IsFromMe, e.Info.Timestamp = id, fromMe, time.Date(2026, 11, 26, 16, 0, 0, 0, time.Local)
+		return e
+	}
+	if !handleScheduledIncoming(store, evt("PHONE", true, cr), chat, "me") {
+		t.Fatal("own scheduled message not handled")
+	}
+	if !handleScheduledIncoming(store, evt("THEIRS", false, cr), chat, "60222") {
+		t.Fatal("their scheduled message not handled")
+	}
+	var c string
+	if err := store.db.QueryRow(`SELECT content FROM messages WHERE id = 'PHONE'`).Scan(&c); err != nil || c != scheduledMarker {
+		t.Errorf("own notice = %q, %v", c, err)
+	}
+	var n int
+	store.db.QueryRow(`SELECT COUNT(*) FROM messages WHERE id = 'THEIRS'`).Scan(&n)
+	if n != 0 {
+		t.Error("stored a row for someone else's unrevealed message")
+	}
+	unschedule := &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
+		Key:  &waCommon.MessageKey{ID: proto.String("PHONE"), FromMe: proto.Bool(true)},
+		Type: waE2E.ProtocolMessage_MESSAGE_UNSCHEDULE.Enum(),
+	}}
+	if !handleScheduledIncoming(store, evt("U1", true, unschedule), chat, "me") {
+		t.Fatal("unschedule not handled")
+	}
+	store.db.QueryRow(`SELECT content FROM messages WHERE id = 'PHONE'`).Scan(&c)
+	if c != scheduledCancelledMarker {
+		t.Errorf("after cancel = %q", c)
+	}
+	if handleScheduledIncoming(store, evt("T", false, &waE2E.Message{Conversation: proto.String("hi")}), chat, "60222") {
+		t.Error("plain text treated as scheduled")
 	}
 }

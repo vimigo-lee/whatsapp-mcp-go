@@ -35,6 +35,7 @@ import (
 	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 )
@@ -545,6 +546,7 @@ func registerScheduledRoutes(ctx context.Context, apiMux *http.ServeMux, client 
 		if _, err := store.SetScheduledStatus(chat.String(), row.ID, scheduledStatusPending, scheduledStatusCancelled); err != nil {
 			slog.Warn("cancelled scheduled message but could not mark it", "id", row.ID, "error", err)
 		}
+		store.markScheduledCancelled(chat.String(), row.ID, row.ScheduledAt)
 		slog.Info("scheduled message cancelled", "id", row.ID, "chat", chat.String())
 		respondJSON(w, http.StatusOK, map[string]any{"success": true})
 	})
@@ -592,7 +594,112 @@ func sendScheduledText(client *whatsmeow.Client, store *MessageStore, recipient 
 		}, sender); err != nil {
 			slog.Warn("failed to store scheduled message", "id", id, "error", err)
 		}
+		// The chat's "You scheduled a message" notice; it becomes the message at its time.
+		if err := store.StoreMessage(id, chatJID, sender, scheduledNotice(scheduledMarker, at), time.Now(), true,
+			"", "", "", "", nil, nil, nil, 0, "", "", "", false); err != nil {
+			slog.Warn("failed to store scheduled notice", "id", id, "error", err)
+		}
 	}
 	slog.Info("message scheduled", "id", id, "chat", to.String(), "at", at.Format(time.RFC3339), "reveal_key_id", sealed.KeyID)
 	return true, fmt.Sprintf("Message to %s scheduled for %s", recipient, at.In(displayLoc).Format("2006-01-02 15:04 MST")), id
+}
+
+// ---- chat notices ----
+//
+// A scheduled message has a row in messages from the moment it is scheduled,
+// so a chat view can show WhatsApp's "You scheduled a message" notice:
+//
+//	[scheduled message]
+//	Scheduled for: 2026-11-28T15:00:00+08:00
+//
+// stamped when it was scheduled. At its time the row becomes the message
+// itself (its text, stamped at the scheduled time); a cancel turns it into
+//
+//	[scheduled message cancelled]
+//	Scheduled for: 2026-11-28T15:00:00+08:00
+//
+// The "Scheduled for" line is left out when the time is unknown (a message
+// scheduled on the owner's phone: whatsmeow does not expose the stanza's st).
+// Only the sender's devices get a notice; WhatsApp shows recipients nothing
+// until the reveal.
+
+const (
+	scheduledMarker          = "[scheduled message]"
+	scheduledCancelledMarker = "[scheduled message cancelled]"
+)
+
+// scheduledNotice is a notice row's content; at may be zero.
+func scheduledNotice(marker string, at time.Time) string {
+	if at.IsZero() {
+		return marker
+	}
+	return marker + "\nScheduled for: " + at.In(time.Local).Format(time.RFC3339)
+}
+
+// isScheduledNotice reports whether content is a scheduled-message notice
+// (pending, not cancelled).
+func isScheduledNotice(content string) bool {
+	return content == scheduledMarker || strings.HasPrefix(content, scheduledMarker+"\n")
+}
+
+// setNoticeContent rewrites a notice row's text without marking it edited.
+func (store *MessageStore) setNoticeContent(chatJID, id, content string) error {
+	_, err := store.db.Exec(pgPlaceholders(`UPDATE messages SET content = ? WHERE chat_jid = ? AND id = ?`), content, chatJID, id)
+	return err
+}
+
+// markScheduledCancelled turns a pending notice row into a cancelled one.
+func (store *MessageStore) markScheduledCancelled(chatJID, id string, at time.Time) {
+	var content string
+	if err := store.db.QueryRow(pgPlaceholders(`SELECT content FROM messages WHERE chat_jid = ? AND id = ?`), chatJID, id).Scan(&content); err != nil {
+		return
+	}
+	if !isScheduledNotice(content) {
+		return
+	}
+	if at.IsZero() {
+		if i := strings.Index(content, "\nScheduled for: "); i >= 0 {
+			if t, err := time.Parse(time.RFC3339, content[i+len("\nScheduled for: "):]); err == nil {
+				at = t
+			}
+		}
+	}
+	if err := store.setNoticeContent(chatJID, id, scheduledNotice(scheduledCancelledMarker, at)); err != nil {
+		slog.Warn("could not mark scheduled notice cancelled", "id", id, "error", err)
+	}
+}
+
+// handleScheduledIncoming handles a ConditionalRevealMessage or a
+// MESSAGE_UNSCHEDULE that came in, and reports whether it did:
+//   - our own (scheduled on the owner's phone or another linked device):
+//     a pending notice row, without a time;
+//   - someone else's scheduled message: nothing (WhatsApp shows recipients
+//     nothing until the reveal, which this bridge cannot see yet: the server
+//     sends the key in a mex notification whatsmeow drops);
+//   - a cancel of our own: the notice row becomes a cancelled one.
+func handleScheduledIncoming(store *MessageStore, msg *events.Message, chatJID, sender string) bool {
+	m := unwrapMessage(msg.Message)
+	if cr := m.GetConditionalRevealMessage(); cr != nil {
+		if msg.Info.IsFromMe && store != nil {
+			if err := store.StoreMessage(msg.Info.ID, chatJID, sender, scheduledMarker, msg.Info.Timestamp, true,
+				"", "", "", "", nil, nil, nil, 0, "", "", "", false); err != nil {
+				slog.Warn("could not store scheduled notice", "id", msg.Info.ID, "error", err)
+			}
+		}
+		slog.Info("scheduled message received", "id", msg.Info.ID, "chat", chatJID, "from_me", msg.Info.IsFromMe,
+			"reveal_key_id", cr.GetRevealKeyID())
+		return true
+	}
+	if pm := m.GetProtocolMessage(); pm != nil && pm.GetType() == waE2E.ProtocolMessage_MESSAGE_UNSCHEDULE {
+		target := pm.GetKey().GetID()
+		if msg.Info.IsFromMe && target != "" && store != nil {
+			store.markScheduledCancelled(chatJID, target, time.Time{})
+			if _, err := store.SetScheduledStatus(chatJID, target, scheduledStatusPending, scheduledStatusCancelled); err != nil {
+				slog.Warn("could not mark scheduled message cancelled", "id", target, "error", err)
+			}
+		}
+		slog.Info("scheduled message cancelled by sender", "id", target, "chat", chatJID, "from_me", msg.Info.IsFromMe)
+		return true
+	}
+	return false
 }
